@@ -1,10 +1,13 @@
 name: CI
 
+# Push-only: every job here is commit-scoped, so one run per commit is
+# sufficient — the checks surface on any open PR because they run against the
+# PR's head commit. Triggering on pull_request as well would run the whole
+# pipeline twice for the same commit. PR-only stages (if any are added later,
+# e.g. coverage posting or fork support) belong in a separate workflow.
 on:
   push:
     branches: ["**"]
-  pull_request:
-    branches: [main]
 
 # Cancel in-progress runs on the same branch when a new push arrives.
 concurrency:
