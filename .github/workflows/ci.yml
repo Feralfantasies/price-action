@@ -131,7 +131,8 @@ jobs:
 
       - name: Trivy — filesystem scan
         # Scans the source tree and Cargo.lock for CVEs and misconfigurations.
-        uses: aquasecurity/trivy-action@master
+        # Pinned to the 0.36.0 release commit (immutable).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -145,7 +146,8 @@ jobs:
       - name: Trivy — container image scan
         # FROM scratch with only a static musl binary: expected to be clean,
         # verified explicitly.
-        uses: aquasecurity/trivy-action@master
+        # Pinned to the 0.36.0 release commit (immutable).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: price-action:${{ github.sha }}
           format: table
@@ -156,8 +158,18 @@ jobs:
         run: |
           # The binary reads config at startup, so verify presence by
           # extracting it from the scratch image rather than running it.
-          docker create --name price-action-smoke price-action:${{ github.sha }}
-          docker cp price-action-smoke:/price-action /tmp/price-action-smoke
-          docker rm price-action-smoke
+          # Container name is unique per run+attempt so concurrent jobs on
+          # shared runners cannot collide; the trap removes only this step's
+          # own container even if a command fails midway.
+          SMOKE_NAME="price-action-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm "$SMOKE_NAME" >/dev/null 2>&1 || true' EXIT
+          docker create --name "$SMOKE_NAME" price-action:${{ github.sha }}
+          docker cp "$SMOKE_NAME":/price-action /tmp/price-action-smoke
+          docker rm "$SMOKE_NAME"
+          trap - EXIT
           test -f /tmp/price-action-smoke
           echo "Binary is present in the container image"
+
+      - name: Cleanup — remove commit-tagged image
+        if: always()
+        run: docker rmi price-action:${{ github.sha }} || true
