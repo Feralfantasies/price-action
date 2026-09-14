@@ -1,0 +1,178 @@
+name: CI
+
+# Push-only: every job here is commit-scoped, so one run per commit is
+# sufficient — the checks surface on any open PR because they run against the
+# PR's head commit. Triggering on pull_request as well would run the whole
+# pipeline twice for the same commit. PR-only stages (if any are added later,
+# e.g. coverage posting or fork support) belong in a separate workflow.
+on:
+  push:
+    branches: ["**"]
+
+# Cancel in-progress runs on the same branch when a new push arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1. Format ──────────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: firethorn
+    timeout-minutes: 10
+    steps:
+      # rustfmt is a pure Rust binary — no C toolchain needed.
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ── 2. Clippy ─────────────────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: firethorn
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: cargo clippy — deny all warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ── 3. Tests ──────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: firethorn
+    timeout-minutes: 30
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo test
+        run: cargo test
+
+  # ── 4. Static musl build (scratch-container binary) ───────────────────────
+  build:
+    name: Build (musl static)
+    runs-on: firethorn
+    timeout-minutes: 30
+    needs: [fmt, clippy]
+    steps:
+      - name: Install system dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo apt-get update -qq && sudo apt-get install -y musl-tools && break
+            echo "apt-get attempt $i failed; retrying in 10 s..."
+            sleep 10
+          done
+
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: cargo build — musl static target
+        run: RUSTFLAGS="-D warnings" cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Verify binary is statically linked
+        run: |
+          ldd target/x86_64-unknown-linux-musl/release/price-action \
+            | grep -q "statically linked" \
+            || { echo "binary is not statically linked"; exit 1; }
+
+  # ── 5. Security audit (RustSec) ───────────────────────────────────────────
+  security-audit:
+    name: Security Audit
+    runs-on: firethorn
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        # The runner pool's CARGO_HOME is on an NFS PVC; cargo-audit fetches
+        # the RustSec advisory database via git, which uses flock — unsupported
+        # on NFS. Override CARGO_HOME so the clone lands on local disk.
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-audit-home
+        run: |
+          mkdir -p "$CARGO_HOME"
+          cargo audit
+
+  # ── 6. Trivy scan + container smoke test ──────────────────────────────────
+  container:
+    name: Trivy + Container
+    runs-on: firethorn
+    timeout-minutes: 45
+    needs: [build]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Trivy — filesystem scan
+        # Scans the source tree and Cargo.lock for CVEs and misconfigurations.
+        # Pinned to the 0.36.0 release commit (immutable).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+
+      - name: Build scratch container
+        run: DOCKER_BUILDKIT=0 docker build -t price-action:${{ github.sha }} .
+
+      - name: Trivy — container image scan
+        # FROM scratch with only a static musl binary: expected to be clean,
+        # verified explicitly.
+        # Pinned to the 0.36.0 release commit (immutable).
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: price-action:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+
+      - name: Smoke test — binary exists in image
+        run: |
+          # The binary reads config at startup, so verify presence by
+          # extracting it from the scratch image rather than running it.
+          # Container name is unique per run+attempt so concurrent jobs on
+          # shared runners cannot collide; the trap removes only this step's
+          # own container even if a command fails midway.
+          SMOKE_NAME="price-action-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm "$SMOKE_NAME" >/dev/null 2>&1 || true' EXIT
+          docker create --name "$SMOKE_NAME" price-action:${{ github.sha }}
+          docker cp "$SMOKE_NAME":/price-action /tmp/price-action-smoke
+          docker rm "$SMOKE_NAME"
+          trap - EXIT
+          test -f /tmp/price-action-smoke
+          echo "Binary is present in the container image"
+
+      - name: Cleanup — remove commit-tagged image
+        if: always()
+        run: docker rmi price-action:${{ github.sha }} || true

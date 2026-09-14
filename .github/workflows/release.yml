@@ -1,0 +1,180 @@
+name: Container Build and Release
+
+# Releases run only after the CI workflow has completed successfully on main
+# (workflow_run), or on manual dispatch. Every run shares one fixed
+# concurrency group so overlapping releases cannot race the tagging step,
+# regardless of ref; in-progress releases are never cancelled.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch: # Allow manual triggering
+
+concurrency:
+  group: container-build-and-release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  create-tag:
+    name: Compute Semantic Version Tag
+    runs-on: firethorn
+    timeout-minutes: 15
+    # Gate: only release when CI on main succeeded, or on manual dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read # dry run only reads history; the tag is published later
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+      changelog: ${{ steps.tag.outputs.changelog }}
+    steps:
+      - name: Checkout
+        # For workflow_run events, check out the exact commit CI validated.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tag (dry run)
+        id: tag
+        # Dry run: derives new_tag and changelog without pushing anything.
+        # The tag is only published after the container image has been built
+        # and pushed successfully, so a failed build never leaves a dangling
+        # git tag behind.
+        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          release_branches: main
+          tag_prefix: v
+          dry_run: true
+          # Tag/changelog must be computed against the exact commit CI
+          # validated, not the default-branch HEAD at trigger time.
+          commit_sha: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+  build-and-push:
+    name: Build and Push Container
+    runs-on: firethorn
+    timeout-minutes: 60
+    needs: create-tag
+    if: needs.create-tag.outputs.new_tag
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The firethorn runners provide docker through a podman sidecar; build
+      # with BuildKit disabled, matching the pattern in ci.yml and larderly's
+      # container jobs. Tags are applied explicitly instead of using
+      # docker/metadata-action.
+      - name: Build image
+        run: |
+          DOCKER_BUILDKIT=0 docker build \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }} \
+            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push image
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+  publish-tag:
+    name: Publish Git Tag
+    runs-on: firethorn
+    timeout-minutes: 15
+    needs: [create-tag, build-and-push]
+    if: needs.create-tag.outputs.new_tag
+    permissions:
+      contents: write # pushes the git tag
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Publish the tag computed by create-tag
+        # custom_tag publishes exactly the tag that was used for the image,
+        # only now that build-and-push has succeeded.
+        uses: mathieudutour/github-tag-action@a22cf08638b34d5badda920f9daf6e72c477b07b # v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          custom_tag: ${{ needs.create-tag.outputs.new_tag }}
+          # new_tag already carries the "v" prefix; the action prepends
+          # tag_prefix to custom_tag too (default "v"), so clear it to avoid
+          # publishing "vv1.2.3".
+          tag_prefix: ""
+          # Attach the tag to the same validated commit the image was built
+          # from, matching create-tag's computation.
+          commit_sha: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: firethorn
+    timeout-minutes: 15
+    needs: [create-tag, build-and-push, publish-tag]
+    if: needs.create-tag.outputs.new_tag
+    permissions:
+      contents: write # creates the GitHub Release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ needs.create-tag.outputs.new_tag }}
+          name: Release ${{ needs.create-tag.outputs.new_tag }}
+          body: |
+            ## 🚀 What's Changed
+            ${{ needs.create-tag.outputs.changelog }}
+
+            ## 📦 Container Image
+            - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }}`
+            - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest`
+
+            ## 🛠️ Usage
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            docker run --rm \
+              -e PRICE_ACTION_SYMBOL=AAPL \
+              -e PRICE_ACTION_MODE=paper \
+              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ```
+
+            Configuration is supplied via `PRICE_ACTION_*` environment
+            variables and/or a TOML file mounted at the path named by
+            `PRICE_ACTION_CONFIG` — see the
+            [README](https://github.com/${{ github.repository }}/blob/${{ needs.create-tag.outputs.new_tag }}/README.md)
+            and
+            [price-action.example.toml](https://github.com/${{ github.repository }}/blob/${{ needs.create-tag.outputs.new_tag }}/price-action.example.toml).
+          draft: false
+          prerelease: false
