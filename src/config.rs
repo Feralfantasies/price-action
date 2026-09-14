@@ -62,7 +62,11 @@ impl fmt::Display for Mode {
 }
 
 /// Fully resolved application configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The [`fmt::Debug`] implementation is manual so that `broker_api_key` is
+/// always redacted — formatting a `Config` (logs, assertion failures) never
+/// exposes the credential.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// Instrument symbol to trade, e.g. `AAPL`.
     pub symbol: String,
@@ -235,14 +239,40 @@ impl Config {
                 "must be at least 1".into(),
             ));
         }
-        if self.mode == Mode::Live && self.broker_url.is_none() {
+        if self.mode == Mode::Live
+            && self
+                .broker_url
+                .as_deref()
+                .is_none_or(|url| url.trim().is_empty())
+        {
             return Err(ConfigError::invalid(
                 "broker_url",
-                "live mode requires PRICE_ACTION_BROKER_URL or broker_url in the config file"
+                "live mode requires a non-empty PRICE_ACTION_BROKER_URL or broker_url in the config file"
                     .into(),
             ));
         }
         Ok(())
+    }
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Config")
+            .field("symbol", &self.symbol)
+            .field("quantity", &self.quantity)
+            .field("mode", &self.mode)
+            .field("bar_interval_secs", &self.bar_interval_secs)
+            .field("series_capacity", &self.series_capacity)
+            .field(
+                "consecutive_closes_threshold",
+                &self.consecutive_closes_threshold,
+            )
+            .field("broker_url", &self.broker_url)
+            .field(
+                "broker_api_key",
+                &self.broker_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
     }
 }
 
@@ -423,5 +453,36 @@ bar_interval_secs = 300
         let env = env_from(BTreeMap::from([("PRICE_ACTION_QUANTITY", "0")]));
         let err = Config::load_from(&no_file(), &env).unwrap_err();
         assert!(err.to_string().contains("quantity"), "{err}");
+    }
+
+    #[test]
+    fn live_mode_rejects_whitespace_only_broker_url() {
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_MODE", "live"),
+            ("PRICE_ACTION_BROKER_URL", "   "),
+        ]));
+        let err = Config::load_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("broker_url"), "{err}");
+    }
+
+    #[test]
+    fn debug_output_redacts_api_key() {
+        let env = env_from(BTreeMap::from([(
+            "PRICE_ACTION_BROKER_API_KEY",
+            "super-secret-value",
+        )]));
+        let cfg = Config::load_from(&no_file(), &env).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("[redacted]"), "{debug}");
+        assert!(!debug.contains("super-secret-value"), "{debug}");
+        // other fields remain visible for diagnostics
+        assert!(debug.contains("symbol"), "{debug}");
+    }
+
+    #[test]
+    fn debug_output_shows_absent_api_key_as_none() {
+        let cfg = Config::load_from(&no_file(), &env_from(BTreeMap::new())).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(debug.contains("broker_api_key: None"), "{debug}");
     }
 }
