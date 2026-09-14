@@ -56,6 +56,9 @@ jobs:
           release_branches: main
           tag_prefix: v
           dry_run: true
+          # Tag/changelog must be computed against the exact commit CI
+          # validated, not the default-branch HEAD at trigger time.
+          commit_sha: ${{ github.event.workflow_run.head_sha || github.sha }}
 
   build-and-push:
     name: Build and Push Container
@@ -123,6 +126,13 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           custom_tag: ${{ needs.create-tag.outputs.new_tag }}
+          # new_tag already carries the "v" prefix; the action prepends
+          # tag_prefix to custom_tag too (default "v"), so clear it to avoid
+          # publishing "vv1.2.3".
+          tag_prefix: ""
+          # Attach the tag to the same validated commit the image was built
+          # from, matching create-tag's computation.
+          commit_sha: ${{ github.event.workflow_run.head_sha || github.sha }}
 
   create-release:
     name: Create GitHub Release
