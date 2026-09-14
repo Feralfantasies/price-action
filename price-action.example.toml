@@ -1,0 +1,31 @@
+# price-action example configuration.
+#
+# Copy to `price-action.toml` (or point PRICE_ACTION_CONFIG at any path).
+# Every key is optional — unset keys fall back to compiled defaults, and any
+# PRICE_ACTION_* environment variable overrides both.
+
+# Instrument to trade.
+symbol = "AAPL"
+
+# Shares/contracts per trade (>= 1).
+quantity = 1
+
+# "paper" (simulated, default) or "live" (requires broker_url; not yet
+# implemented).
+mode = "paper"
+
+# Bar interval in seconds (>= 1).
+bar_interval_secs = 60
+
+# Number of recent bars retained in the rolling window (>= 1).
+series_capacity = 500
+
+# Consecutive higher/lower closes before the example strategy signals (>= 1).
+consecutive_closes_threshold = 3
+
+# Broker/venue API base URL — required in live mode.
+# broker_url = "https://broker.example/api"
+
+# Broker API key. Prefer the PRICE_ACTION_BROKER_API_KEY environment variable
+# or a mounted secret over putting credentials in this file.
+# broker_api_key = "..."
