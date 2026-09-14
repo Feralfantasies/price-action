@@ -14,4 +14,8 @@ pub enum Error {
     /// A strategy failed to process a bar.
     #[error("strategy error: {0}")]
     Strategy(String),
+
+    /// Configuration could not be loaded or is invalid.
+    #[error("config error: {0}")]
+    Config(String),
 }

@@ -10,9 +10,13 @@
 //!   (a paper-trading implementation is included).
 //! - [`engine`] drives the loop: feed a bar, get a signal, act on it.
 //!
+//! - [`config`] resolves the layered configuration: environment variables
+//!   override the TOML config file, which overrides compiled defaults.
+//!
 //! Data-source adapters (broker APIs, market-data feeds) are intentionally not
 //! part of the initial scaffold.
 
+pub mod config;
 pub mod engine;
 pub mod error;
 pub mod execution;

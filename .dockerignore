@@ -1,0 +1,7 @@
+target/
+.git/
+.devcontainer/
+*.md
+Dockerfile
+.dockerignore
+price-action.toml
