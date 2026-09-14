@@ -1,5 +1,12 @@
 # price-action
 
+> ⚠️ **DISCLAIMER — READ BEFORE USE.** This software is for **educational and
+> research purposes only** and is **not financial advice**. Automated trading
+> involves substantial risk of loss, including loss of your entire capital.
+> You use it **entirely at your own risk** and are solely responsible for any
+> orders placed or losses incurred. The authors accept **no liability** for
+> any damages or trading losses. See [DISCLAIMER.md](DISCLAIMER.md).
+
 Automated price-action trading in Rust: strategies driven by raw price
 movement (bars), not by derived indicators.
 
@@ -33,4 +40,5 @@ cargo test
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Use is additionally subject to
+[DISCLAIMER.md](DISCLAIMER.md).
