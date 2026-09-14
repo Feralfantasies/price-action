@@ -63,8 +63,9 @@ impl Strategy for ConsecutiveCloses {
     }
 
     fn on_bar(&mut self, bar: &Bar) -> Result<Signal, Error> {
+        let close = bar.close();
         let signal = match self.prev_close {
-            Some(prev) if bar.close > prev => {
+            Some(prev) if close > prev => {
                 self.run = if self.run > 0 {
                     self.run.saturating_add(1)
                 } else {
@@ -72,7 +73,7 @@ impl Strategy for ConsecutiveCloses {
                 };
                 self.evaluate()
             }
-            Some(prev) if bar.close < prev => {
+            Some(prev) if close < prev => {
                 self.run = if self.run < 0 {
                     self.run.saturating_sub(1)
                 } else {
@@ -85,7 +86,7 @@ impl Strategy for ConsecutiveCloses {
                 Signal::Flat
             }
         };
-        self.prev_close = Some(bar.close);
+        self.prev_close = Some(close);
         Ok(signal)
     }
 }
@@ -100,7 +101,8 @@ mod tests {
         closes
             .iter()
             .map(|&close| {
-                let bar = Bar::new(SystemTime::UNIX_EPOCH, close, close, close, close, 0.0);
+                let bar =
+                    Bar::new(SystemTime::UNIX_EPOCH, close, close, close, close, 0.0).unwrap();
                 strategy.on_bar(&bar).unwrap()
             })
             .collect()
