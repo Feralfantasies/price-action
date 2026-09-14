@@ -1,0 +1,36 @@
+[package]
+name = "price-action"
+version = "0.1.0"
+edition = "2021"
+description = "Automated price-action trading: strategies driven by raw price movement"
+license = "MIT"
+
+[dependencies]
+thiserror = "2"
+
+[workspace.lints.clippy]
+# Pedantic lints enforce careful, idiomatic code. Kept as deny; instances are
+# fixed in the code rather than allowed.
+pedantic = { level = "deny", priority = -1 }
+# Nursery lints are experimental and can change between clippy releases, so they
+# are warnings rather than hard failures.
+nursery = { level = "warn", priority = -1 }
+# Panic-prevention restriction lints. These catch real bugs and stay deny.
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+panic = "deny"
+exit = "deny"
+# arithmetic_side_effects and as_conversions are intentionally warn (not deny):
+# they fire on safe, bounded arithmetic (date offsets, rank counters) and would
+# otherwise require pervasive checked arithmetic with no safety benefit.
+arithmetic_side_effects = "warn"
+as_conversions = "warn"
+
+[lints]
+workspace = true
