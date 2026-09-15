@@ -17,7 +17,6 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -82,6 +81,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Compute image reference
+        id: image
+        # Docker/Podman repository names must be lowercase; github.repository
+        # preserves the org's display casing (e.g. "Feralfantasies/price-action"),
+        # which docker rejects as an invalid reference.
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          echo "ref=${REGISTRY}/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       # The firethorn runners provide docker through a podman sidecar; build
       # with BuildKit disabled, matching the pattern in ci.yml and larderly's
       # container jobs. Tags are applied explicitly instead of using
@@ -89,14 +98,14 @@ jobs:
       - name: Build image
         run: |
           DOCKER_BUILDKIT=0 docker build \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }} \
-            -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest \
+            -t ${{ steps.image.outputs.ref }}:${{ needs.create-tag.outputs.new_tag }} \
+            -t ${{ steps.image.outputs.ref }}:latest \
             .
 
       - name: Push image
         run: |
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }}
-          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ steps.image.outputs.ref }}:${{ needs.create-tag.outputs.new_tag }}
+          docker push ${{ steps.image.outputs.ref }}:latest
 
   publish-tag:
     name: Publish Git Tag
@@ -148,6 +157,13 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
+      - name: Compute image reference
+        id: image
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          echo "ref=${REGISTRY}/$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
@@ -158,16 +174,16 @@ jobs:
             ${{ needs.create-tag.outputs.changelog }}
 
             ## 📦 Container Image
-            - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.create-tag.outputs.new_tag }}`
-            - `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest`
+            - `${{ steps.image.outputs.ref }}:${{ needs.create-tag.outputs.new_tag }}`
+            - `${{ steps.image.outputs.ref }}:latest`
 
             ## 🛠️ Usage
             ```bash
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            docker pull ${{ steps.image.outputs.ref }}:latest
             docker run --rm \
               -e PRICE_ACTION_SYMBOL=AAPL \
               -e PRICE_ACTION_MODE=paper \
-              ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+              ${{ steps.image.outputs.ref }}:latest
             ```
 
             Configuration is supplied via `PRICE_ACTION_*` environment
