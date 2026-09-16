@@ -74,9 +74,12 @@ pub fn save_bars(bars: impl IntoIterator<Item = Bar>, path: impl AsRef<Path>) ->
 
     writeln!(out, "{HEADER}").map_err(|_| write_failed())?;
     for bar in bars {
+        // `{}` (Display) is a lossless round-trip representation for any
+        // finite f64 — arbitrary-precision prices survive save→load exactly,
+        // unlike fixed `"{:.2}"` formatting.
         writeln!(
             out,
-            "{},{:.2},{:.2},{:.2},{:.2},{}",
+            "{},{},{},{},{},{}",
             unix_secs(bar.timestamp()),
             bar.open(),
             bar.high(),
@@ -257,6 +260,76 @@ mod tests {
         let path = dir.join("missing.csv");
         let err = load_bars(&path).expect_err("missing file");
         assert!(err.to_string().contains("cannot read bar file"));
+    }
+
+    #[test]
+    fn save_round_trips_prices_with_more_than_two_decimals() {
+        // Values parsed from strings so the literals never look "unreadable";
+        // parsing is bit-exact, which is what the assertions below rely on.
+        let p = |s: &str| -> f64 { s.parse().expect("parse") };
+        // Round-trip via Display must be lossless (bit-for-bit), including
+        // values a fixed {:.2} format would silently truncate. Replay is then
+        // exercised end-to-end over the loaded bars to prove behaviour holds.
+        let dir = testdir();
+        let path = dir.join("precise.csv");
+        let original: Vec<Bar> = [
+            Bar::new(
+                UNIX_EPOCH,
+                p("100.23456789"),
+                p("100.987654321"),
+                p("100.12345678"),
+                p("100.5"),
+                12.34,
+            ),
+            Bar::new(
+                UNIX_EPOCH + Duration::from_secs(60),
+                p("100.50000001"),
+                p("101.987654321"),
+                100.5,
+                101.5,
+                p("8.77"),
+            ),
+            Bar::new(
+                UNIX_EPOCH + Duration::from_secs(120),
+                p("101.50000001"),
+                102.9,
+                p("101.11111111"),
+                102.22,
+                3.6,
+            ),
+            Bar::new(
+                UNIX_EPOCH + Duration::from_secs(180),
+                p("102.22000001"),
+                p("103.45678901"),
+                101.7,
+                103.05,
+                22.5,
+            ),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, Error>>()
+        .expect("valid bars");
+
+        save_bars(original.clone(), &path).expect("save");
+        let loaded = load_bars(&path).expect("load");
+        assert_eq!(loaded.len(), original.len());
+        for (i, (want, got)) in std::iter::zip(original.iter(), loaded.iter()).enumerate() {
+            // Display is a bit-exact round-trip for any finite f64: this
+            // catches both truncation and re-rounding.
+            assert_eq!(got.open().to_bits(), want.open().to_bits(), "bar {i}");
+            assert_eq!(got.high().to_bits(), want.high().to_bits(), "bar {i}");
+            assert_eq!(got.low().to_bits(), want.low().to_bits(), "bar {i}");
+            assert_eq!(got.close().to_bits(), want.close().to_bits(), "bar {i}");
+            assert_eq!(got.volume().to_bits(), want.volume().to_bits(), "bar {i}");
+        }
+
+        // Replay behaviour survives the round-trip: four rising closes with
+        // the default threshold-3 strategy → one Long entry, as before.
+        let config = crate::config::Config::default();
+        let report = crate::replay::run(&config, &path).expect("replay run");
+        assert_eq!(report.bars, original.len());
+        assert_eq!(report.entries, 1);
+        assert!(matches!(report.final_signal, crate::strategy::Signal::Long));
     }
 
     #[test]

@@ -16,8 +16,9 @@ strategy is trusted anywhere near real money — this is always step 1.
 
 Replay is the recommended way to answer *"do these settings behave the way I
 expect on real market history?"*. It feeds a CSV of OHLCV bars through the
-exact engine + strategy + paper broker used in live mode (with no real
-execution, ever) and prints every signal.
+exact engine + strategy used in live mode — but **always** against an
+in-memory `PaperBroker`, regardless of what mode the configuration sets, and
+prints every signal.
 
 ### 1. Build it locally
 
@@ -44,7 +45,8 @@ cargo run
 ### 2. Replay the bundled sample data
 
 A small sample file is committed at [`samples/sample-bars.csv`](samples/sample-bars.csv) —
-25 hourly bars with a realistic shape (an up-leg, a pullback, then recovery).
+25 fifteen-minute bars (900-second timestamp increments) with a realistic
+shape (an up-leg, a pullback, then recovery).
 **It is synthetic demo data shaped like real trades, not actual exchange
 prices**; use it to learn the workflow, then point replay at genuine history
 (Step 4) to verify settings for real.
@@ -75,9 +77,13 @@ How to read it:
   that bar** (`Flat`, `Long` or `Short`).
 - `(entry)` marks transitions from flat into a position — i.e. actual trade
   events. The footer counts them: `entries=2 of 25 bars`.
-- Replay always executes on an in-memory paper broker, even if `mode = "live"`
-  is configured — it never places or simulates costed orders; it reports what
-  the strategy *would* decide.
+- Replay always executes on an in-memory `PaperBroker` regardless of the
+  configured mode — it never places or simulates costed orders; it reports
+  what the strategy *would* decide. General configuration validation still
+  runs before any bar is fed (invalid symbol, quantity or threshold are
+  refused just like for a real run), but because paper-only execution needs
+  no venue, replay takes a config path that skips the live-mode `broker_url`
+  requirement — so no broker setup is ever needed to replay.
 
 ### 3. Verify how a setting changes behaviour
 
@@ -243,9 +249,10 @@ Build and run:
 ```sh
 docker build -t price-action .
 docker run --rm \
+  -v "$PWD/aapl-daily.csv:/data/bars.csv:ro" \
   -e PRICE_ACTION_SYMBOL=MSFT \
   -e PRICE_ACTION_MODE=paper \
-  price-action replay /data/bars.csv   # after mounting bars.csv at /data
+  price-action replay /data/bars.csv
 ```
 
 Released images are published to GitHub Container Registry on every green CI
