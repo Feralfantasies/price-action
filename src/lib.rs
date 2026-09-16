@@ -14,11 +14,14 @@
 //!   override the TOML config file, which overrides compiled defaults.
 //!
 //! Data-source adapters (broker APIs, market-data feeds) are intentionally not
-//! part of the initial scaffold.
+//! part of the initial scaffold; recorded data can be replayed with
+//! [`replay`].
 
 pub mod config;
+pub mod csv;
 pub mod engine;
 pub mod error;
 pub mod execution;
 pub mod market;
+pub mod replay;
 pub mod strategy;

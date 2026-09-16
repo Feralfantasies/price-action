@@ -124,6 +124,10 @@ impl Config {
     /// [`DEFAULT_CONFIG_PATH`]. A missing file is not an error; an unreadable
     /// or malformed one is.
     ///
+    /// This path enforces *all* validation, including execution-specific
+    /// rules (live mode requires `broker_url`) — use it for anything the app
+    /// might actually run.
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] when the config file cannot be read or parsed,
@@ -132,22 +136,53 @@ impl Config {
     pub fn load() -> Result<Self, ConfigError> {
         let env = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
         let path = env(CONFIG_PATH_VAR).unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
-        Self::load_from(Path::new(&path), &env)
+        Self::load_into(Path::new(&path), &env, true)
+    }
+
+    /// Loads configuration for tool paths that never execute orders — e.g.
+    /// bar replay.
+    ///
+    /// File/env layering and general validation (symbol presence, positive
+    /// quantities, strategy parameters) are identical to [`Config::load`];
+    /// only the execution-only rule (live mode demanding a non-empty broker
+    /// URL) is skipped, which a paper-broker replay has no use for.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::load`] minus the live-mode `broker_url` requirement.
+    pub fn load_for_replay() -> Result<Self, ConfigError> {
+        let env = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
+        let path = env(CONFIG_PATH_VAR).unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+        Self::load_into(Path::new(&path), &env, false)
+    }
+
+    /// Shared layering: defaults ← config file ← environment.
+    ///
+    /// # Errors
+    ///
+    /// See [`Config::load`]; when `check_execution` is `false`, the
+    /// live-mode broker requirement does not apply.
+    fn load_into(path: &Path, env: EnvFn<'_>, check_execution: bool) -> Result<Self, ConfigError> {
+        let mut config = Self::default();
+        config.apply_file(path)?;
+        config.apply_env(env)?;
+        config.validate_general()?;
+        if check_execution {
+            config.validate_execution()?;
+        }
+        Ok(config)
     }
 
     /// Loads configuration from an explicit file path and environment lookup.
-    /// Layering and validation match [`Config::load`].
+    /// Layering and validation match [`Config::load`] (i.e. it also applies
+    /// execution validation).
     ///
     /// # Errors
     ///
     /// Returns [`ConfigError`] on file, parse, environment, or validation
     /// failures.
     pub fn load_from(path: &Path, env: EnvFn<'_>) -> Result<Self, ConfigError> {
-        let mut config = Self::default();
-        config.apply_file(path)?;
-        config.apply_env(env)?;
-        config.validate()?;
-        Ok(config)
+        Self::load_into(path, env, true)
     }
 
     fn apply_file(&mut self, path: &Path) -> Result<(), ConfigError> {
@@ -211,7 +246,9 @@ impl Config {
         Ok(())
     }
 
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// General validation: symbol presence, positive quantities and strategy
+    /// parameters. Applies to *every* caller, including replay.
+    fn validate_general(&self) -> Result<(), ConfigError> {
         if self.symbol.trim().is_empty() {
             return Err(ConfigError::invalid("symbol", "must not be empty".into()));
         }
@@ -239,6 +276,14 @@ impl Config {
                 "must be at least 1".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Execution-specific validation: the live-mode broker requirement.
+    /// Kept separate from [`validate_general`](Self::validate_general) so
+    /// tool paths that resolve configuration but never execute (replay) can
+    /// skip it without weakening anything an actual run enforces.
+    fn validate_execution(&self) -> Result<(), ConfigError> {
         if self.mode == Mode::Live
             && self
                 .broker_url
