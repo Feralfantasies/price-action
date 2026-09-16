@@ -1,0 +1,5 @@
+# price-action Knowledge Bundle — Update Log
+
+## 2026-09-16
+* **Creation**: Established the [OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md) knowledge bundle in `docs/`: [Overview](overview.md), [Replay Workflow](replay-workflow.md), [Trading Engine](engine.md), [Consecutive Closes Strategy](strategy-consecutive-closes.md), [Market Data Model](market-data-model.md), [Execution Layer](execution-layer.md), [Bar File Format](bar-file-format.md), [Sample Bar File](sample-bars.md), [Configuration](configuration.md), [Container Image & Release](container-image-and-release.md), [Development Workflow](development-workflow.md), [Disclaimer & Risk](disclaimer-risk.md), and this bundle's own [Update Guide](bundle-update-guide.md).
+* **Rule change**: The repository now carries an `AGENTS.md` that mandates reading this bundle before any change and keeping it current with every behaviour-affecting PR (see the workspace agent rules for the disclosure workflow).
