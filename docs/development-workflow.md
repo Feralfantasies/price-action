@@ -3,7 +3,7 @@ type: Playbook
 title: Development Workflow
 description: Toolchain, strict lint policy (pedantic + panic-prevention set), verification commands, MSRV notes, and project layout for anyone changing the code.
 tags: [development, tooling, lints, testing]
-status: stable
+status: draft
 sources:
   - id: toml
     resource: /Cargo.toml
@@ -45,7 +45,7 @@ The project is strict about what counts as passing code.[^toml][^code-quality]
 
 ```sh
 cargo fmt --check        # formatting (CI fails on diffs)
-cargo clippy --all-targets -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test               # full suite: lib + bin targets
 ```
 

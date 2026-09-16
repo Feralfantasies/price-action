@@ -73,7 +73,7 @@ Run the full pass from the [Development Workflow](docs/development-workflow.md):
 
 ```sh
 cargo fmt --check
-cargo clippy --all-targets -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 

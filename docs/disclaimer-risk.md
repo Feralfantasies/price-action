@@ -3,7 +3,7 @@ type: Reference
 title: Disclaimer & Risk
 description: Educational-purpose status of this software — not financial advice, substantial risk of loss, and the paper-only execution stance.
 tags: [disclaimer, risk, compliance]
-status: stable
+status: draft
 sources:
   - id: disclaimer-md
     resource: /DISCLAIMER.md

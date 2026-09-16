@@ -3,7 +3,7 @@ type: Reference
 title: Overview
 description: What price-action is, its architecture pipeline, and its current scope — paper-only, no market-data adapters yet.
 tags: [overview, architecture, scope]
-status: stable
+status: draft
 sources:
   - id: readme
     resource: /README.md

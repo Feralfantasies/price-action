@@ -3,7 +3,7 @@ type: Reference
 title: Execution Layer
 description: The Broker trait, Position enum, and the in-memory PaperBroker — the only broker implementation today.
 tags: [execution, broker, architecture]
-status: stable
+status: draft
 sources:
   - id: execution-src
     resource: /src/execution.rs

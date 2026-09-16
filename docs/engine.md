@@ -3,7 +3,7 @@ type: Reference
 title: Trading Engine
 description: The bar-to-signal-to-position loop, its last_signal semantics, and the failure-retry invariant.
 tags: [engine, architecture, execution]
-status: stable
+status: draft
 sources:
   - id: engine-src
     resource: /src/engine.rs
@@ -36,10 +36,14 @@ move the broker to the position implied by the returned signal.[^engine-src]
 
 ## Invariants
 
-- **No drift.** Bars are not fed to the strategy until a previously failed
-  execution succeeds, so strategy and broker state cannot fall out of step.
-  The test suite pins this with a deliberately failing broker: bar 2 is
-  *never* consumed while the retry of bar 1's position fails.[^engine-src]
+- **No *additional* drift while an execution is pending.** A failed fresh
+  execution leaves the strategy a bar ahead of the broker (strategies update
+  their state in `on_bar` before the broker call — for `ConsecutiveCloses` the
+  run counter and previous close have already moved); until the pending
+  position's retry succeeds, **no further bars are consumed by the strategy**,
+  so no *additional* drift can accumulate. The test suite pins this with a
+  deliberately failing broker: bar 2 is *never* fed while the retry of bar
+  1's position fails.[^engine-src]
 - **`last_signal` is an executed-position truth, not "what the strategy last
   asked for".** It only advances on successful execution.
 - Errors propagate as `Error::Strategy` (strategy rejected the bar) or

@@ -3,7 +3,7 @@ type: Playbook
 title: Replay Workflow
 description: The sanctioned workflow for verifying how the configured strategy reacts to historic bars — replay is read-only by design.
 tags: [replay, verification, workflow]
-status: stable
+status: draft
 sources:
   - id: readme
     resource: /README.md
@@ -19,9 +19,9 @@ generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
 
 Replay answers the question *"do these settings behave the way I expect on
 real market history?"* It feeds a [bar file](bar-file-format.md) through the
-**exact** engine + strategy used in live mode — but **always** against an
-in-memory `PaperBroker`, regardless of what `mode` the configuration sets, and
-prints every signal.[^readme] This is always step 1 before any strategy is
+**same shared application engine + strategy** used by every run — but
+**always against an in-memory `PaperBroker`, regardless of what `mode` the
+configuration sets, and prints every signal.[^readme] This is always step 1 before any strategy is
 trusted anywhere near real money.
 
 ## Guarantees (by design)
@@ -133,8 +133,9 @@ docker run --rm \
 ## Updating documentation when replay behaviour changes
 
 Any change to the CLI surface, the trace format, the entry-counting rule, or
-the config path used by replay must be reflected in this document and in
-[`README.md`](../README.md) in the same pull request — see
+the config path used by replay must be reflected in this document, in
+[`README.md`](../README.md), and — per [AGENTS.md](../AGENTS.md) — with an
+entry appended to [`log.md`](log.md) in the same pull request; see
 [Bundle Update Guide](bundle-update-guide.md).
 
 [^readme]: README.md quick-start and configuration sections

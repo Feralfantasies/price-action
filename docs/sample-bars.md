@@ -3,7 +3,7 @@ type: Data Sample
 title: Sample Bar File (synthetic)
 description: The bundled 25-bar synthetic demo dataset at samples/sample-bars.csv — shaped like real trades, not exchange prices.
 tags: [sample-data, csv, replay]
-status: stable
+status: draft
 resource: /samples/sample-bars.csv
 sources:
   - id: sample-csv
@@ -61,6 +61,8 @@ Any change to `samples/sample-bars.csv` (rows, cadence, values) requires:
 - updating this concept (counts, timestamp step, price shape, known-output line);
 - updating every expected-output block in [README.md](../README.md) and the
   [Replay Workflow](replay-workflow.md) that cites it;
+- appending an entry to [`log.md`](log.md) (required for any docs/
+  change, per [AGENTS.md](../AGENTS.md));
 - re-verifying with `cargo test` plus a manual replay run — see
   [Bundle Update Guide](bundle-update-guide.md).
 

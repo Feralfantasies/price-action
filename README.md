@@ -20,9 +20,8 @@ under [`docs/`](docs/) — read it before changing anything, and see
 
 Replay is the recommended way to answer *"do these settings behave the way I
 expect on real market history?"*. It feeds a CSV of OHLCV bars through the
-exact engine + strategy used in live mode — but **always** against an
-in-memory `PaperBroker`, regardless of what mode the configuration sets, and
-prints every signal.
+same shared application engine + strategy used by every run — but
+**always** against an in-memory `PaperBroker`, regardless of what mode the configuration sets, and prints every signal.
 
 ### 1. Build it locally
 

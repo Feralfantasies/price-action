@@ -3,7 +3,7 @@ type: Playbook
 title: Bundle Update Guide
 description: How to keep this OKF bundle in sync with the code — which documents a change must touch, and how frontmatter gets maintained.
 tags: [documentation, maintenance, okf]
-status: stable
+status: draft
 sources:
   - id: spec
     resource: https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md

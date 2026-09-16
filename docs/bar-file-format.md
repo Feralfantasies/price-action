@@ -3,7 +3,7 @@ type: Reference
 title: OHLCV Bar File Format
 description: The CSV format replay consumes — header, column schema, Unix-second timestamps, validation rules, and lossless price round-trips.
 tags: [csv, data-format, replay]
-status: stable
+status: draft
 sources:
   - id: csv-src
     resource: /src/csv.rs
@@ -43,17 +43,18 @@ Rules:
 
 ## Validation on load
 
-Errors are `Error::MarketData` and always carry the **1-based line number** so
-bad rows are locatable:[^csv-src]
+Errors are `Error::MarketData`. **Row-level** errors carry the 1-based line
+number so bad rows are locatable; file-level errors name the problem without
+a line number:[^csv-src]
 
 | Bad input | Error shape |
 |---|---|
-| Wrong header | `line 1: unexpected CSV header ... (expected "timestamp,open,high,low,close,volume")` |
+| Wrong header | `line 1: unexpected CSV header <actual> (expected \`timestamp,open,high,low,close,volume\`)` |
 | Row with ≠ 6 fields | `line N: expected 6 comma-separated fields, found M` |
 | Non-numeric field | `line N: invalid <column> value '<raw>' (expected a finite number)` |
-| `"inf"`/`"NaN"` style values | Same "finite number" error — explicit finiteness check, because Rust's `f64` parsing accepts `inf`. |
-| Header only, no data rows | `bar file contains no data lines` |
-| Missing/unreadable file | `cannot read bar file <path>: <io error>` |
+| `"inf"`/`"NaN"` style values | Same line-N "finite number" error — explicit finiteness check, because Rust's `f64` parsing accepts `inf`. |
+| Header only, no data rows | `bar file contains no data lines` (no line number) |
+| Missing/unreadable file | `cannot read bar file <path>: <io error>` (no line number) |
 
 ## Writing / round-trip guarantees
 

@@ -3,7 +3,7 @@ type: Reference
 title: Configuration
 description: Three-layer configuration precedence (env vars, TOML file, compiled defaults), the complete settings table, and validation rules.
 tags: [configuration, env-vars, toml]
-status: stable
+status: draft
 sources:
   - id: config-src
     resource: /src/config.rs
@@ -74,6 +74,8 @@ Adding a new setting means touching **all three layers** plus docs in one PR:
    [Replay Workflow](replay-workflow.md) A/B examples.
 4. Add tests: default application, file override, env-over-file precedence,
    invalid-value error naming the source (follow the existing test patterns).
+5. Append an entry to [`log.md`](log.md) — same commit stack, per
+   [AGENTS.md](../AGENTS.md).
 
 [^config-src]: `src/config.rs`: layering impl, validation split, redacting Debug impl, and its test module
 

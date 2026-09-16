@@ -3,7 +3,7 @@ type: Reference
 title: Market Data Model
 description: The Bar (validated OHLCV) and BarSeries rolling window types that all strategies receive.
 tags: [market-data, architecture]
-status: stable
+status: draft
 sources:
   - id: market-src
     resource: /src/market.rs

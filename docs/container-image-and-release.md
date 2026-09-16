@@ -3,7 +3,7 @@ type: Reference
 title: Container Image & Release
 description: The FROM-scratch container image, its static-link and rustls constraints, CI jobs, and how releases land on GHCR with git tags.
 tags: [container, docker, ci, release, scratch]
-status: stable
+status: draft
 sources:
   - id: dockerfile
     resource: /Dockerfile
@@ -63,7 +63,7 @@ jobs use read-only contents permissions.[^ci-yml]
 | Job | What it enforces |
 |---|---|
 | Format | `cargo fmt --check`. |
-| Clippy | `cargo clippy --all-targets -D warnings` (pedantic + panic-prevention lints — see [Development Workflow](development-workflow.md)). |
+| Clippy | `cargo clippy --all-targets -- -D warnings` (pedantic + panic-prevention lints — see [Development Workflow](development-workflow.md)). |
 | Tests | `cargo test`. |
 | Build (musl static) | Builds for `x86_64-unknown-linux-musl` and asserts the binary is statically linked. |
 | Security Audit | `cargo-audit` against `Cargo.lock`. |

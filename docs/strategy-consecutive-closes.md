@@ -3,7 +3,7 @@ type: Reference
 title: Consecutive Closes Strategy
 description: The only shipping strategy — long after N consecutive higher closes, short after N consecutive lower closes, else flat.
 tags: [strategy, signals]
-status: stable
+status: draft
 sources:
   - id: strategy-src
     resource: /src/strategy.rs
