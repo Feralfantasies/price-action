@@ -7,6 +7,17 @@
 //! P/L per closed trade, and roll-ups by UTC calendar day plus the whole
 //! session. Replay stays read-only by design: no venue is ever touched.
 //!
+//! Insolvency policy (defined, not silent): an unrealized loss never touches
+//! available funds — equity simply falls as the mark moves against the
+//! position. When a close would drive free funds below zero (a realized loss
+//! beyond what closing frees), free funds **floor at 0** for that bar and
+//! onward: the shortfall is written off in that same bar's mark. Because an
+//! account cannot be worth less than nothing, equity floors at 0 as well —
+//! an insolvent position contributes zero to account value rather than
+//! negative debt. Free funds are never reported negative, and trade rows keep
+//! reporting the full arithmetic P/L of each position regardless of any
+//! write-off. There is no margining on top of this: the floor *is* the model
+//!
 //! Arithmetic note: every value here is a finite, display-grade money or date
 //! quantity whose operands are validated upstream (config and `Bar`), so the
 //! workspace-wide `arithmetic_side_effects` warning is allowed per-site —
@@ -71,7 +82,8 @@ pub struct SessionTotals {
     pub final_available: f64,
     /// Equity including a mark of any position open at `final_close`.
     pub final_equity: f64,
-    /// Fees paid on every entry and exit leg.
+    /// Fees on every leg booked so far — including the entry leg of a
+    /// position still open when the session ends.
     pub total_fees_paid: f64,
     /// Sum of net P/L over all closed trades.
     pub total_net_pl: f64,
@@ -122,16 +134,14 @@ pub struct PaperAccount {
     entry_ts_secs: i64,
     entry_day: String,
     closed_trades: Vec<ClosedTrade>,
+    /// Sum of fees on every leg **booked so far**, including the entry leg of
+    /// a still-open position (exit legs are booked when they happen).
     total_fees_paid: f64,
-    /// Running realized net P/L in the chronological close sequence; this is
-    /// the canonical session total (see `session_totals`). Keeping one
-    /// addition order for day rows and the session row makes the displayed
-    /// figures coherent by construction on multi-day files — floating-point
-    /// sums are order-sensitive at sub-cent scale, so two different orders
-    /// can drift by a reported cent.
+    /// Running realized net P/L in close order over closed trades only; this
+    /// is the canonical session figure, added in the same order as the per-day
+    /// rows so displayed values stay coherent on multi-day files (f64 sums are
+    /// order-sensitive at sub-cent scale).
     canonical_net_running: f64,
-    /// Same idea for fees paid across all closed legs.
-    canonical_fees_running: f64,
 }
 
 impl PaperAccount {
@@ -154,7 +164,6 @@ impl PaperAccount {
             closed_trades: Vec::new(),
             total_fees_paid: 0.0,
             canonical_net_running: 0.0,
-            canonical_fees_running: 0.0,
         }
     }
 
@@ -253,11 +262,13 @@ impl PaperAccount {
     /// Longs mark to market (`available` plus shares at price). Shorts mark
     /// the locked-in collateral plus unrealized P/L — a short's available is
     /// not inflated by full-notional capital that never existed, so its mark
-    /// must not drop by a full notional while open.
-    #[allow(clippy::arithmetic_side_effects)] // bounded money math
+    /// must not drop by a full notional while open. Per the module's
+    /// insolvency policy the finished value floors at 0 (equity is never
+    /// reported negative).
+    #[allow(clippy::arithmetic_side_effects)] // bounded money math; floor per policy
     #[must_use]
     pub fn mark_equity(&self, price: f64) -> f64 {
-        match self.open_side {
+        let value = match self.open_side {
             Some(Side::Long) => {
                 let long_mark = self.quantity * price; // free funds + shares at price
                 self.available + long_mark
@@ -268,12 +279,16 @@ impl PaperAccount {
                 self.available + self.entry_notional + short_pl
             }
             None => self.available,
-        }
+        };
+        value.max(0.0)
     }
 
     /// Per-UTC-day roll-ups: entries started, exits completed, and net realized
-    /// P/L of trades that **exited** the day. ISO date strings sort
-    /// chronologically.
+    /// P/L of trades that **exited** the day. A position still open at the end
+    /// of the session counts as an entry on its entry day (its fees are
+    /// likewise included in [`SessionTotals`] via `total_fees_paid`). If a
+    /// trade opened and closed on the same day it is counted once in each.
+    /// ISO date strings sort chronologically.
     #[allow(clippy::arithmetic_side_effects)] // bounded money math
     #[must_use]
     pub fn per_day_totals(&self) -> Vec<DayTotal> {
@@ -306,15 +321,32 @@ impl PaperAccount {
                 d.net_realized_pl += trade.net_pl;
             }
         }
+        // A position still open at the end of the session never produced a
+        // closed-trade row, yet its entry did happen: count it on that day.
+        if self.is_open() {
+            let entry_day = self.entry_day.clone();
+            if let Some(d) = days.iter_mut().find(|d| d.day == entry_day) {
+                d.entries += 1;
+            } else {
+                days.push(DayTotal {
+                    day: entry_day,
+                    entries: 1,
+                    exits: 0,
+                    net_realized_pl: 0.0,
+                });
+            }
+        }
         days.sort_by(|a, b| a.day.cmp(&b.day));
         days
     }
 
     /// Session roll-up; `final_close` marks any still-open position.
     ///
-    /// Realized P/L and fees use the canonical chronological totals (same
-    /// close-ordered additions as the per-day rows), so on multi-day files
-    /// they stay coherent with what the day table displays, cent for cent.
+    /// `total_fees_paid` covers every leg booked so far — including the entry
+    /// leg of a position still open at session end. Realized P/L uses the
+    /// canonical close-ordered total over closed trades, the same additions
+    /// the per-day rows use, so displayed figures stay coherent on multi-day
+    /// files.
     #[allow(clippy::arithmetic_side_effects)] // bounded money math
     #[must_use]
     pub fn session_totals(&self, final_close: Option<f64>) -> SessionTotals {
@@ -322,7 +354,7 @@ impl PaperAccount {
             starting_balance: self.starting_balance,
             final_available: self.available,
             final_equity: final_close.map_or(self.available, |p| self.mark_equity(p)),
-            total_fees_paid: self.canonical_fees_running,
+            total_fees_paid: self.total_fees_paid,
             total_net_pl: self.canonical_net_running,
         }
     }
@@ -335,6 +367,11 @@ impl PaperAccount {
 
     /// Closes the open position at `close`: committed capital returns, signed
     /// P/L is credited, and the exit fee (on this bar's notional) is charged.
+    ///
+    /// Insolvency policy (no margining — this *is* the whole model): if the
+    /// realized loss plus fees exceed what closing frees, free funds floor at
+    /// **zero**; the shortfall is written off in the same bar's mark, which
+    /// reduces equity without ever reporting negative `available` afterwards.
     fn exit_position(&mut self, bar_index: usize, ts_secs: i64, close: f64) {
         if !self.is_open() {
             return; // defensive: idempotent under repeated calls
@@ -350,18 +387,18 @@ impl PaperAccount {
             Side::Short => (entry_price - close) * self.quantity,
         };
 
-        // Release capital, credit P/L, charge the exit fee — in that order.
-        self.available += committed;
-        self.available += gross_pl;
-        self.available -= exit_fee;
+        // Release capital, credit P/L, charge the exit fee — clamped so free
+        // funds never go negative; a covered loss still lands on equity via
+        // this bar's mark. The write-off is the entire insolvency model.
+        let freed = committed + gross_pl - exit_fee;
+        self.available = (self.available + freed).max(0.0);
         self.total_fees_paid += exit_fee;
 
         let fees_paid = entry_fee + exit_fee;
         let net_pl = gross_pl - fees_paid;
 
-        // Canonical chronological totals (close order == vector order).
+        // Canonical chronological total over realized (closed) P/L.
         self.canonical_net_running += net_pl;
-        self.canonical_fees_running += fees_paid;
 
         self.closed_trades.push(ClosedTrade {
             index: self.closed_trades.len().saturating_add(1),
@@ -596,6 +633,64 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(totals.total_net_pl, days[0].net_realized_pl);
         assert_eq!(totals.total_fees_paid, acc.total_fees_paid());
+    }
+
+    #[test]
+    fn open_position_at_session_end_is_counted_in_day_and_fees() {
+        // Entry on 2024-09-04, no exit: the day table must still show the
+        // entry (and the session fees must include that leg), per the
+        // roll-up contract.
+        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let out = acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+        assert!(!out.entry_skipped);
+
+        let days = acc.per_day_totals();
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].day, "2024-09-04");
+        assert_eq!(days[0].entries, 1);
+        assert_eq!(days[0].exits, 0);
+        near(days[0].net_realized_pl, 0.0);
+
+        let totals = acc.session_totals(Some(12.0));
+        // The still-open entry leg is booked: fee 10 * 5e-4, net realized P/L
+        // stays 0 (nothing closed yet).
+        near(totals.total_fees_paid, 0.005);
+        near(totals.total_net_pl, 0.0);
+        near(acc.total_fees_paid(), 0.005);
+    }
+
+    #[test]
+    fn insolvent_short_floors_at_zero_rather_than_negative_debt() {
+        // Free funds stay ≥ the entry cost by construction (10.01 covers
+        // notional 10 + fee 0.005); the exit then loses far more than the
+        // account holds: 10 - 25 = -15 against 0.005 of free funds.
+        let mut acc = PaperAccount::new(1, 10.01, 5);
+        let out = acc.on_bar(&S::Short, 0, &bar(10.0, D_BASE));
+        assert!(!out.entry_skipped);
+        near(out.state.available, 0.005);
+
+        // While open: mark floors at zero instead of reporting -4.995.
+        let out = acc.on_bar(&S::Short, 1, &bar(25.0, D_BASE + 900));
+        assert!(!out.entry_skipped);
+        near(out.state.equity, 0.0);
+
+        // Exit: realized loss of -15 (trade rows keep the full arithmetic),
+        // free funds floor at zero instead of going to -5.0…
+        let out = acc.on_bar(&S::Flat, 2, &bar(25.0, D_BASE + 1_800));
+        assert_eq!(out.effective_signal, S::Flat);
+        near(out.state.available, 0.0);
+        near(acc.mark_equity(25.0), 0.0);
+
+        let t = &acc.closed_trades()[0];
+        near(t.gross_pl, -15.0);
+        near(t.fees_paid, 0.005 + 0.0125); // entry 10*5e-4 + exit 25*5e-4
+        near(t.net_pl, -15.0175);
+
+        let totals = acc.session_totals(Some(25.0));
+        near(totals.final_available, 0.0);
+        near(totals.final_equity, 0.0); // floored, not negative debt
+        near(totals.total_net_pl, -15.0175); // arithmetic loss still reported
+        near(totals.total_fees_paid, 0.0175);
     }
 
     #[test]

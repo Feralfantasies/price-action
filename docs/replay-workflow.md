@@ -17,7 +17,7 @@ sources:
   - id: mainrs
     resource: /src/main.rs
     title: Binary entry-point source
-generated: { by: pi-agent/use_this, at: 2026-09-17T07:05:00Z }
+generated: { by: pi-agent/use_this, at: 2026-09-17T14:30:00Z }
 ---
 
 Replay answers the question *"do these settings behave the way I expect on
@@ -30,8 +30,11 @@ trusted anywhere near real money.
 ## Guarantees (by design)
 
 - **Read-only, always.** Replay runs on a `PaperBroker` no matter the
-  configured mode; it never places or simulates costed orders — it reports
-  what the strategy *would* decide.[^readme][^replayrs]
+  configured mode and **never sends orders to any broker**; it reports what
+  the strategy *would* decide. It does, however, *simulate accounting costs for
+  reporting*: funds are committed (or reserved as collateral) at entries,
+  flat per-side fees are charged, and cash/equity are updated bar by bar —
+  all in memory; nothing is sent or persisted.[^readme][^replayrs]
 - **No broker setup needed.** Replay loads configuration through
   `Config::load_for_replay()`: identical layering and general validation to a
   real run, but the execution-only rule (live mode demanding `broker_url`) is

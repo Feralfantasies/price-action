@@ -282,11 +282,14 @@ Unknown config-file keys are rejected (typos fail fast). `live` mode requires
 `broker_url`; an empty variable is treated as unset. Prefer the environment or
 a mounted secret for `broker_api_key` rather than committing it to a file.
 
-`PRICE_ACTION_SYMBOL`, `QUANTITY`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic
-during replay (there are no orders); `CONSECUTIVE_CLOSES_THRESHOLD` changes
-the signal trace, while `STARTING_BALANCE` and `TRADE_FEE_BPS` change the
-paper-account numbers (funds, fees, P/L) for the same trace — which is why
-the Step 3 example toggles the former.
+`PRICE_ACTION_SYMBOL`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic during
+replay (there are no orders). The remaining three all change what you see:
+`CONSECUTIVE_CLOSES_THRESHOLD` moves the signals in the trace, while
+`QUANTITY`, `STARTING_BALANCE` and `TRADE_FEE_BPS` drive the paper-account
+numbers — every bar's notional (and thus committed funds, fees, cash/equity,
+together with each trade's P/L) scales or is priced by them; a starting
+balance that cannot cover an entry turns it into an `(insufficient funds)`
+skip instead. That is why the Step 3 examples toggle threshold and balance.
 
 ## Container deployment
 
