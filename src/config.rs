@@ -66,7 +66,8 @@ impl fmt::Display for Mode {
 /// The [`fmt::Debug`] implementation is manual so that `broker_api_key` is
 /// always redacted — formatting a `Config` (logs, assertion failures) never
 /// exposes the credential.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
+/// `Eq` intentionally absent: `Config` holds an f64 (`starting_balance`).
 pub struct Config {
     /// Instrument symbol to trade, e.g. `AAPL`.
     pub symbol: String,
@@ -80,6 +81,12 @@ pub struct Config {
     pub series_capacity: usize,
     /// Consecutive higher/lower closes before the example strategy signals.
     pub consecutive_closes_threshold: u32,
+    /// Starting funds for replay paper-accounting. Must be greater than 0 and
+    /// finite; every replay trade is funded from it (see `replay` accounting).
+    pub starting_balance: f64,
+    /// Fee charged in basis points on each side's trade notional at entry and
+    /// exit during replay accounting (5 = 0.05%).
+    pub trade_fee_bps: u32,
     /// Broker/venue API base URL. Required in live mode.
     pub broker_url: Option<String>,
     /// Broker API key. Prefer the environment variable or a mounted secret
@@ -96,6 +103,8 @@ impl Default for Config {
             bar_interval_secs: 60,
             series_capacity: 500,
             consecutive_closes_threshold: 3,
+            starting_balance: 10_000.0,
+            trade_fee_bps: 5,
             broker_url: None,
             broker_api_key: None,
         }
@@ -113,6 +122,8 @@ struct FileConfig {
     bar_interval_secs: Option<u64>,
     series_capacity: Option<usize>,
     consecutive_closes_threshold: Option<u32>,
+    starting_balance: Option<f64>,
+    trade_fee_bps: Option<u32>,
     broker_url: Option<String>,
     broker_api_key: Option<String>,
 }
@@ -213,6 +224,12 @@ impl Config {
         if let Some(v) = file.consecutive_closes_threshold {
             self.consecutive_closes_threshold = v;
         }
+        if let Some(v) = file.starting_balance {
+            self.starting_balance = v;
+        }
+        if let Some(v) = file.trade_fee_bps {
+            self.trade_fee_bps = v;
+        }
         if let Some(v) = file.broker_url {
             self.broker_url = Some(v);
         }
@@ -232,6 +249,8 @@ impl Config {
             "CONSECUTIVE_CLOSES_THRESHOLD",
             &mut self.consecutive_closes_threshold,
         )?;
+        env_override(env, "STARTING_BALANCE", &mut self.starting_balance)?;
+        env_override(env, "TRADE_FEE_BPS", &mut self.trade_fee_bps)?;
 
         if let Some(raw) = env("PRICE_ACTION_MODE") {
             self.mode = Mode::parse(&raw)
@@ -276,6 +295,14 @@ impl Config {
                 "must be at least 1".into(),
             ));
         }
+        // `f64`'s `FromStr` accepts strings like `inf`/`NaN`, so the explicit
+        // finiteness check matters (same as for bar prices).
+        if !self.starting_balance.is_finite() || self.starting_balance <= 0.0 {
+            return Err(ConfigError::invalid(
+                "starting_balance",
+                "must be a finite value greater than 0".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -312,6 +339,8 @@ impl fmt::Debug for Config {
                 "consecutive_closes_threshold",
                 &self.consecutive_closes_threshold,
             )
+            .field("starting_balance", &self.starting_balance)
+            .field("trade_fee_bps", &self.trade_fee_bps)
             .field("broker_url", &self.broker_url)
             .field(
                 "broker_api_key",
@@ -498,6 +527,42 @@ bar_interval_secs = 300
         let env = env_from(BTreeMap::from([("PRICE_ACTION_QUANTITY", "0")]));
         let err = Config::load_from(&no_file(), &env).unwrap_err();
         assert!(err.to_string().contains("quantity"), "{err}");
+    }
+
+    #[test]
+    fn accounting_defaults() {
+        let cfg = Config::default();
+        assert!((cfg.starting_balance - 10_000.0).abs() < f64::EPSILON * 32.0);
+        assert_eq!(cfg.trade_fee_bps, 5);
+    }
+
+    #[test]
+    fn accounting_settings_file_and_env_precedence() {
+        let path = write_temp_config("starting_balance = 25_000\ntrade_fee_bps = 10\n");
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_STARTING_BALANCE", "500"),
+            ("PRICE_ACTION_TRADE_FEE_BPS", "2"),
+        ]));
+        let cfg = Config::load_from(&path, &env).unwrap();
+        assert!((cfg.starting_balance - 500.0).abs() < f64::EPSILON * 32.0); // env beats file
+        assert_eq!(cfg.trade_fee_bps, 2); // env beats file
+
+        let cfg = Config::load_from(&path, &env_from(BTreeMap::new())).unwrap();
+        assert!((cfg.starting_balance - 25_000.0).abs() < f64::EPSILON * 32.0); // file beats default
+        assert_eq!(cfg.trade_fee_bps, 10);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn zero_or_non_finite_starting_balance_is_rejected() {
+        for raw in ["0", "-1", "inf", "NaN"] {
+            let env = env_from(BTreeMap::from([("PRICE_ACTION_STARTING_BALANCE", raw)]));
+            let err = Config::load_from(&no_file(), &env).unwrap_err();
+            assert!(
+                err.to_string().contains("starting_balance"),
+                "for {raw}: {err}"
+            );
+        }
     }
 
     #[test]

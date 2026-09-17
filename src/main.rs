@@ -50,7 +50,8 @@ fn run_replay(path: &str) -> Result<(), Error> {
     let config = Config::load_for_replay()?;
     print_config_banner(&config);
     let report = replay::run(&config, path)?;
-    replay::print_report(&config, &report, std::io::stdout())
+    let mut stdout = std::io::stdout();
+    replay::print_report(&config, &report, &mut stdout)
         .map_err(|e| Error::MarketData(format!("cannot print replay report: {e}")))
 }
 
