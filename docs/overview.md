@@ -34,7 +34,8 @@ market → strategy → engine → execution
 | `src/engine.rs` | The trading loop: bar → signal → broker position | [Trading Engine](engine.md) |
 | `src/execution.rs` | `Broker` trait, `Position`, in-memory `PaperBroker` | [Execution Layer](execution-layer.md) |
 | `src/csv.rs` | OHLCV CSV reading/writing (the replay data format) | [OHLCV Bar File Format](bar-file-format.md) |
-| `src/replay.rs` | Replay runner + human-readable per-bar report | [Replay Workflow](replay-workflow.md) |
+| `src/replay.rs` | Replay runner + human-readable per-bar report (trace, trade tables, roll-ups) | [Replay Workflow](replay-workflow.md) |
+| `src/accounting.rs` | Funded paper account the report prices with: fees, P/L, UTC-day bucketing | [Paper Trading Accounting](paper-trading-accounting.md) |
 | `src/config.rs` | Layered configuration: env → config file → defaults | [Configuration](configuration.md) |
 | `src/error.rs` | Shared `Error` type (`MarketData` / `Execution` / `Strategy` / `Config`) | — |
 | `src/main.rs` | Binary entry point: no-args readiness check and the `replay` subcommand | [Development Workflow](development-workflow.md) |

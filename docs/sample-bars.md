@@ -33,16 +33,34 @@ generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
 
 ## Known output (defaults)
 
-With the compiled defaults (`consecutive-closes`, threshold 3):
+With the compiled defaults (`consecutive-closes`, threshold 3, paper account
+10 000 at 5 bps per side):
 
 ```text
+closed paper trades (net of fees):
+  #  side  entry day  entry @ exit day   exit @ invested gross P/L fees net P/L
+  1. long  2024-09-04 214.55  2024-09-04 214.20 214.55   -0.35     0.21 -0.56
+  2. short 2024-09-04 212.95  2024-09-04 213.05 212.95   -0.10     0.21 -0.31
+
+totals per UTC day (24h):
+  day        entries exits realized P/L (net)
+  2024-09-04 2       2     -0.88
+
+session totals:
+  starting balance                    10000.00
+  final available funds               9999.12
+  final equity (marked at last close) 9999.12
+  realized P/L, net of fees (2)       -0.88
+  fees paid (all legs)                0.43
+
 result: signal=Flat entries=2 of 25 bars - paper execution only, no orders placed
 ```
 
 Two `(entry)` marks appear in the trace — one on the rising leg and one after
-the pullback. If a code or data change alters this line for this unmodified
-file and defaults, treat it as a regression to investigate *and* refresh both
-this document and the README's expected output.
+the pullback. If a code or data change alters any of this for this unmodified
+file and defaults (trace, trade rows, roll-ups *or* footer line), treat it as
+a regression to investigate *and* refresh both this document and the README's
+expected output.
 
 ## How to use it
 

@@ -10,11 +10,14 @@ sources:
     title: Repository README (quick-start and replay sections)
   - id: replayrs
     resource: /src/replay.rs
-    title: Replay module source
+    title: Replay module source (report shape and roll-ups)
+  - id: accountingsrc
+    resource: /src/accounting.rs
+    title: Paper-account accounting source (fees, P/L, day bucketing, tests)
   - id: mainrs
     resource: /src/main.rs
     title: Binary entry-point source
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+generated: { by: pi-agent/use_this, at: 2026-09-17T07:05:00Z }
 ---
 
 Replay answers the question *"do these settings behave the way I expect on
@@ -36,7 +39,10 @@ trusted anywhere near real money.
   quantity or threshold is still refused, just like for a real run.[^mainrs]
 - **Full audit trail.** One line per bar in file order, with OHLCV and the
   signal after that bar; `(entry)` marks transitions from flat into a position
-  (i.e. actual trade events), and the footer counts them.
+  and the footer counts them. Each trace line also carries the paper account's
+  `cash=` (free funds) and `equity=` (free funds plus any open position marked
+  at that close) immediately after that bar, and unfunded entries print an
+  `(insufficient funds)` note instead.[^accountingsrc]
 
 ## Invocation
 
@@ -60,11 +66,29 @@ a usage error and exit code 1.[^mainrs]
 ```text
 price-action replay - 25 bars
 symbol=AAPL mode=Paper quantity=1 strategy=consecutive-closes threshold=3
+paper account: starting_balance=10000.00 trade_fee_bps=5 (per side, on the notional)
 ------------------------------------------------------------------------------
-t=1725458400    o=211.98    h=212.97    l=211.59    c=212.50    v=  45731000 -> Flat
+t=1725458400    o=211.98    h=212.97    l=211.59    c=212.50    v=  45731000 -> Flat  cash=10000.00 equity=10000.00
 ...
-t=1725461100    o=213.90    h=214.86    l=213.62    c=214.55    v=  47924000 -> Long   (entry)
+t=1725461100    o=213.90    h=214.86    l=213.62    c=214.55    v=  47924000 -> Long   (entry)  cash=9785.34 equity=9999.89
 ...
+------------------------------------------------------------------------------
+closed paper trades (net of fees):
+  #  side  entry day  entry @ exit day   exit @ invested gross P/L fees net P/L
+  1. long  2024-09-04 214.55  2024-09-04 214.20 214.55   -0.35     0.21 -0.56
+  ...
+
+totals per UTC day (24h):
+  day        entries exits realized P/L (net)
+  2024-09-04 2       2     -0.88
+
+session totals:
+  starting balance                    10000.00
+  final available funds               9999.12
+  final equity (marked at last close) 9999.12
+  realized P/L, net of fees (2)       -0.88
+  fees paid (all legs)                0.43
+
 result: signal=Flat entries=2 of 25 bars - paper execution only, no orders placed
 ```
 
@@ -72,8 +96,25 @@ result: signal=Flat entries=2 of 25 bars - paper execution only, no orders place
   the trace (files themselves are not truncated — see the
   [bar file format](bar-file-format.md)).
 - The signal shown is the strategy's position **after** that bar.
+- `cash=`/`equity=` are the paper account's free funds and total value right
+  after this bar; they move on entries (capital locked + entry fee), exits
+  (capital released ± realized P/L − exit fee) and while open (equity tracks
+  the close).
 - An empty result line (`entries=N of M bars`) plus final `signal=` summarises
-  the run; the footer reminds you this was paper execution only.
+  the signal trace; the footer reminds you this was paper execution only.
+
+## How the paper account is priced
+
+The trade tables and totals are produced by a funded **paper account** that
+prices every bar's decision: entries and exits at the close of the causing
+bar, fixed `quantity` sizing, flat basis-point fees per side (default 5 bps =
+0.05%), reserved collateral for shorts, skip-and-note when free funds run out,
+equity marked at each bar's close, and UTC-calendar-day roll-ups. The complete
+rule set — including how to re-check any reported figure from a single trace
+line — is documented in [Paper Trading Accounting](paper-trading-accounting.md)
+(`src/accounting.rs`, test-covered). Replay remains read-only: the account
+reports what the decisions *would* have cost or earned; it places no orders,
+persists nothing, and has no live path behind it.
 
 ## Verifying how a setting changes behaviour
 
@@ -90,6 +131,18 @@ PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD=5 \
   cargo run -- replay samples/sample-bars.csv | tail -1
 # result: signal=Flat entries=0 of 25 bars ...
 ```
+
+The paper account obeys the same settings, so A/B runs differ in the trade
+tables and session totals exactly as much as in the trace. Example — a funded
+account can survive a run that otherwise trades:
+
+```sh
+# Same signals (threshold 1) but starting_balance too small for a 213 close:
+PRICE_ACTION_STARTING_BALANCE=100 PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD=1 \
+  cargo run -- replay samples/sample-bars.csv | grep -m 2 "insufficient funds"
+t=... -> Long   (insufficient funds)  cash=100.00 equity=100.00
+```
+
 
 Diffing full traces shows exactly when signals diverge:
 

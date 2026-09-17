@@ -11,7 +11,7 @@ sources:
   - id: example-toml
     resource: /price-action.example.toml
     title: Example TOML config file
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+generated: { by: pi-agent/use_this, at: 2026-09-17T07:05:00Z }
 ---
 
 Trading options resolve in strict precedence order — **environment variables
@@ -33,7 +33,9 @@ override the config file, which overrides compiled defaults**.[^config-src]
 | Trading mode | `PRICE_ACTION_MODE` | `mode` | `paper` | `"paper"` or `"live"` (case-insensitive) — any other value is rejected as an unknown mode.[^config-src] Live also requires a broker URL in the normal path, and live trading is not implemented yet (see [Overview](overview.md)). Cosmetic during replay. |
 | Bar interval (secs) | `PRICE_ACTION_BAR_INTERVAL_SECS` | `bar_interval_secs` | `60` | ≥ 1. Documents the interval bars are assumed to be at; affects what "consecutive" means to a strategy fed that data. Cosmetic during replay. |
 | Rolling-window size | `PRICE_ACTION_SERIES_CAPACITY` | `series_capacity` | `500` | Bars retained by a `BarSeries` (see [Market Data Model](market-data-model.md)). ≥ 1; not exercised by the current strategy or replay. |
-| Strategy threshold | `PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD` | `consecutive_closes_threshold` | `3` | Consecutive higher/lower closes before the example strategy signals (see [Consecutive Closes Strategy](strategy-consecutive-closes.md)). ≥ 1; **the one replay setting that changes what you see**. |
+| Strategy threshold | `PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD` | `consecutive_closes_threshold` | `3` | Consecutive higher/lower closes before the example strategy signals (see [Consecutive Closes Strategy](strategy-consecutive-closes.md)). ≥ 1; one of the replay settings that changes what you see. |
+| Paper starting balance | `PRICE_ACTION_STARTING_BALANCE` | `starting_balance` | `10000` | Funds the replay report's paper account (f64); must be finite and strictly greater than 0. Replay-only: no live path exists yet, so nothing else reads it. |
+| Paper trade fee (basis points) | `PRICE_ACTION_TRADE_FEE_BPS` | `trade_fee_bps` | `5` | Fee charged per side of each paper trade, in basis points of that leg's notional (`bps / 10_000`; default 5 = 0.05%). ≥ 0; zero disables fees exactly. See [Replay Workflow](replay-workflow.md). |
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ | Required when running normally with mode `live`; an empty/whitespace value is treated as absent and rejected in that case. Never needed for replay (see below). |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ | Secret — prefer the env var or a mounted secret over committing it to a file, and never commit it to the repo. Redacted in all debug output of `Config`. |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` | Only an env var; names where the config file (precedence layer 2) is read from. |
