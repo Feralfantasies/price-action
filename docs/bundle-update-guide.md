@@ -37,6 +37,7 @@ merging.
 | Your change touches… | You MUST update |
 |---|---|
 | CLI surface (argv, subcommands, exit behaviour) | [Replay Workflow](replay-workflow.md) invocation section, [Development Workflow](development-workflow.md) smoke matrix, `README.md` quick start. |
+| Replay report shape or paper-accounting semantics | [Replay Workflow](replay-workflow.md) (expected output + guarantees), [Paper Trading Accounting](paper-trading-accounting.md) for any change to pricing rules/skips/roll-ups, and every expected-output block in `README.md` + [Sample Bar File](sample-bars.md) when the default run changes. |
 | Strategy rules or a new strategy | [Consecutive Closes Strategy](strategy-consecutive-closes.md) (or a new concept per strategy), [Overview](overview.md) scope if "only shipping strategy" changes; new files also need an [index.md](index.md) entry. |
 | Configuration knobs (add/remove/rename) | [Configuration](configuration.md) table, `price-action.example.toml`, `README.md` config section, and [Replay Workflow](replay-workflow.md) A/B examples if replay-visible. |
 | Bar/CSV format or validation | [Bar File Format](bar-file-format.md); [Sample Bar File](sample-bars.md) if fixtures change; `README.md` data-creation notes. |

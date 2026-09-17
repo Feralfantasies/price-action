@@ -23,6 +23,14 @@ series_capacity = 500
 # Consecutive higher/lower closes before the example strategy signals (>= 1).
 consecutive_closes_threshold = 3
 
+# Paper starting balance for replay reporting — free funds before the first
+# trade, e.g. 10000 (must be a finite number greater than 0). Replay-only.
+starting_balance = 10000
+
+# Paper trade fee in basis points per side of each replay report trade
+# (>= 0; 5 = 0.05% of each leg's notional; 0 disables fees).
+trade_fee_bps = 5
+
 # Broker/venue API base URL — required in live mode.
 # broker_url = "https://broker.example/api"
 

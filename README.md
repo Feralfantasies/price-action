@@ -58,19 +58,38 @@ prices**; use it to learn the workflow, then point replay at genuine history
 cargo run -- replay samples/sample-bars.csv
 ```
 
-Expected output (defaults: `consecutive-closes` strategy with threshold 3):
+Expected output (defaults: `consecutive-closes` strategy with threshold 3,
+paper account starting at 10 000.00, fee of 5 bps per side):
 
 ```text
 price-action replay - 25 bars
 symbol=AAPL mode=Paper quantity=1 strategy=consecutive-closes threshold=3
+paper account: starting_balance=10000.00 trade_fee_bps=5 (per side, on the notional)
 ------------------------------------------------------------------------------
-t=1725458400    o=211.98    h=212.97    l=211.59    c=212.50    v=  45731000 -> Flat
-t=1725459300    o=212.50    h=213.41    l=212.22    c=213.10    v=  46462000 -> Flat
+t=1725458400    o=211.98    h=212.97    l=211.59    c=212.50    v=  45731000 -> Flat  cash=10000.00 equity=10000.00
+t=1725459300    o=212.50    h=213.41    l=212.22    c=213.10    v=  46462000 -> Flat  cash=10000.00 equity=10000.00
 ...
-t=1725461100    o=213.90    h=214.86    l=213.62    c=214.55    v=  47924000 -> Long   (entry)
-t=1725462000    o=214.55    h=215.49    l=214.16    c=215.02    v=  48655000 -> Long
-t=1725462900    o=215.02    h=215.33    l=213.92    c=214.20    v=  49386000 -> Flat
+t=1725461100    o=213.90    h=214.86    l=213.62    c=214.55    v=  47924000 -> Long   (entry)  cash=9785.34 equity=9999.89
+t=1725462000    o=214.55    h=215.49    l=214.16    c=215.02    v=  48655000 -> Long  cash=9785.34 equity=10000.36
+t=1725462900    o=215.02    h=215.33    l=213.92    c=214.20    v=  49386000 -> Flat  cash=9999.44 equity=9999.44
 ...
+------------------------------------------------------------------------------
+closed paper trades (net of fees):
+  #  side  entry day  entry @ exit day   exit @ invested gross P/L fees net P/L
+  1. long  2024-09-04 214.55  2024-09-04 214.20 214.55   -0.35     0.21 -0.56
+  2. short 2024-09-04 212.95  2024-09-04 213.05 212.95   -0.10     0.21 -0.31
+
+totals per UTC day (24h):
+  day        entries exits realized P/L (net)
+  2024-09-04 2       2     -0.88
+
+session totals:
+  starting balance                    10000.00
+  final available funds               9999.12
+  final equity (marked at last close) 9999.12
+  realized P/L, net of fees (2)       -0.88
+  fees paid (all legs)                0.43
+
 result: signal=Flat entries=2 of 25 bars - paper execution only, no orders placed
 ```
 
@@ -80,13 +99,19 @@ How to read it:
   that bar** (`Flat`, `Long` or `Short`).
 - `(entry)` marks transitions from flat into a position — i.e. actual trade
   events. The footer counts them: `entries=2 of 25 bars`.
+- Every line also shows the paper account's **`cash=`** (free funds) and
+  **`equity=`** (free funds plus any open position marked at that close).
+  Below the trace a table lists each closed trade with its fees and net P/L,
+  rolls them up per UTC day, and finishes with session totals; an entry the
+  account cannot fund notes `(insufficient funds)` on that line instead.
 - Replay always executes on an in-memory `PaperBroker` regardless of the
-  configured mode — it never places or simulates costed orders; it reports
-  what the strategy *would* decide. General configuration validation still
-  runs before any bar is fed (invalid symbol, quantity or threshold are
-  refused just like for a real run), but because paper-only execution needs
-  no venue, replay takes a config path that skips the live-mode `broker_url`
-  requirement — so no broker setup is ever needed to replay.
+  configured mode — it never places real orders, and there is still no live
+  execution path; the paper numbers are a priced simulation for review only.
+  General configuration validation still runs before any bar is fed (invalid
+  symbol, quantity or threshold are refused just like for a real run), but
+  because paper-only execution needs no venue, replay takes a config path
+  that skips the live-mode `broker_url` requirement — so no broker setup is
+  ever needed to replay.
 
 ### 3. Verify how a setting changes behaviour
 
@@ -187,7 +212,8 @@ docker run --rm \
 | `src/execution.rs` | `Broker` trait and in-memory `PaperBroker` |
 | `src/engine.rs` | The trading loop: bar → signal → broker position |
 | `src/csv.rs` | OHLCV CSV reading/writing (the replay data format) |
-| `src/replay.rs` | Replay runner + human-readable report |
+| `src/replay.rs` | Replay runner + human-readable report (trace, trades, day/session roll-ups) |
+| `src/accounting.rs` | Funded paper account for the replay report: fees, P/L, UTC-day bucketing |
 | `src/config.rs` | Layered configuration: env → config file → defaults |
 | `src/error.rs` | Shared error type |
 
@@ -246,6 +272,8 @@ override the config file, which overrides compiled defaults**:
 | Bar interval (secs) | `PRICE_ACTION_BAR_INTERVAL_SECS` | `bar_interval_secs` | `60` |
 | Rolling-window size | `PRICE_ACTION_SERIES_CAPACITY` | `series_capacity` | `500` |
 | Strategy threshold | `PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD` | `consecutive_closes_threshold` | `3` |
+| Paper starting balance | `PRICE_ACTION_STARTING_BALANCE` | `starting_balance` | `10000` |
+| Paper trade fee (bps per side) | `PRICE_ACTION_TRADE_FEE_BPS` | `trade_fee_bps` | `5` |
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` |
@@ -254,9 +282,14 @@ Unknown config-file keys are rejected (typos fail fast). `live` mode requires
 `broker_url`; an empty variable is treated as unset. Prefer the environment or
 a mounted secret for `broker_api_key` rather than committing it to a file.
 
-`PRICE_ACTION_SYMBOL`, `QUANTITY`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic
-during replay (there are no orders); `CONSECUTIVE_CLOSES_THRESHOLD` is the one
-that changes what you see, which is why the Step 3 example toggles it.
+`PRICE_ACTION_SYMBOL`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic during
+replay (there are no orders). The remaining three all change what you see:
+`CONSECUTIVE_CLOSES_THRESHOLD` moves the signals in the trace, while
+`QUANTITY`, `STARTING_BALANCE` and `TRADE_FEE_BPS` drive the paper-account
+numbers — every bar's notional (and thus committed funds, fees, cash/equity,
+together with each trade's P/L) scales or is priced by them; a starting
+balance that cannot cover an entry turns it into an `(insufficient funds)`
+skip instead. That is why the Step 3 examples toggle threshold and balance.
 
 ## Container deployment
 
