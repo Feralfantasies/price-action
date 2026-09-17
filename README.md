@@ -12,13 +12,16 @@ movement (bars), not by derived indicators. A built-in **replay** mode lets
 you check how the configured strategy reacts to historic bar data before that
 strategy is trusted anywhere near real money — this is always step 1.
 
+📚 Full documentation lives in an [Open Knowledge Format bundle](docs/index.md)
+under [`docs/`](docs/) — read it before changing anything, and see
+[AGENTS.md](AGENTS.md) for how agents are required to maintain it.
+
 ## Quick start: verify settings against historic data
 
 Replay is the recommended way to answer *"do these settings behave the way I
 expect on real market history?"*. It feeds a CSV of OHLCV bars through the
-exact engine + strategy used in live mode — but **always** against an
-in-memory `PaperBroker`, regardless of what mode the configuration sets, and
-prints every signal.
+same shared application engine + strategy used by every run — but
+**always** against an in-memory `PaperBroker`, regardless of what mode the configuration sets, and prints every signal.
 
 ### 1. Build it locally
 
@@ -192,6 +195,37 @@ Market-data source adapters (broker/venue APIs, live feeds) are not part of the
 initial scaffold; replay is how you exercise the full pipeline offline until
 they exist. Live trading (`mode = "live"`) is also **not implemented yet** and
 the binary refuses to run it — paper only, by design, for now.
+See [Overview](docs/overview.md) in the knowledge bundle for the authoritative
+pipeline diagram and current scope.
+
+## Documentation
+
+The repository ships an [Open Knowledge Format (OKF v0.2)](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+knowledge bundle under [`docs/`](docs/) — start at the
+[bundle index](docs/index.md). It is the authoritative, code-verified reference
+for agents and humans; this README covers quick start and day-to-day usage
+while `docs/` covers behaviour, formats, and rules.
+
+| Document | What it covers |
+|---|---|
+| [Overview](docs/overview.md) | Architecture pipeline, current scope (paper-only), module map |
+| [Replay Workflow](docs/replay-workflow.md) | Verifying settings against historic bars; guarantees; A/B loops |
+| [Trading Engine](docs/engine.md) | The bar → signal → position loop and its retry invariant |
+| [Consecutive Closes Strategy](docs/strategy-consecutive-closes.md) | The only shipping strategy: rule, state machine, tuning |
+| [Market Data Model](docs/market-data-model.md) | `Bar` (validated OHLCV) and the `BarSeries` rolling window |
+| [Execution Layer](docs/execution-layer.md) | `Broker` trait, `Position`, in-memory `PaperBroker` |
+| [OHLCV Bar File Format](docs/bar-file-format.md) | CSV schema, validation rules, lossless round-trips |
+| [Sample Bar File](docs/sample-bars.md) | The bundled synthetic 25-bar demo dataset (and its known output) |
+| [Configuration](docs/configuration.md) | Precedence model, complete settings table, validation |
+| [Container Image & Release](docs/container-image-and-release.md) | `FROM scratch` rules (static + rustls), CI jobs, GHCR releases |
+| [Development Workflow](docs/development-workflow.md) | Toolchain, strict lint policy, verification commands, layout |
+| [Disclaimer & Risk](docs/disclaimer-risk.md) | Educational-purpose status and risk positioning |
+
+**Rules for agents:** [AGENTS.md](AGENTS.md) makes reading the bundle before any
+change mandatory — and requires every behaviour-affecting PR to update
+`docs/` (including [`docs/log.md`](docs/log.md)) in the same commit stack. The
+maintenance rules themselves live in the
+[Bundle Update Guide](docs/bundle-update-guide.md).
 
 ## Configuration
 
