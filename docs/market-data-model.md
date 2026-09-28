@@ -8,11 +8,18 @@ sources:
   - id: market-src
     resource: /src/market.rs
     title: Market module source (impl + tests)
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 `market.rs` holds the raw price data types. Everything downstream — strategies,
-the engine, [replay](replay-workflow.md) — receives `Bar`s.[^market-src]
+the engine, [replay](replay-workflow.md) and the
+[live session](live-market-data-session.md) — receives `Bar`s.[^market-src]
+
+`Bar` is the single convergence point of the two data sources: replay builds
+them from CSV rows, and a live session builds them from streamed WebSocket
+events (held minute windows, or ticks aggregated per second). Because both end
+up in the same validated type, nothing downstream can tell — or needs to tell —
+which source produced a bar.
 
 ## `Bar` — one OHLCV bar
 

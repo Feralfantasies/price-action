@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Configuration
-description: Three-layer configuration precedence (env vars, TOML file, compiled defaults), the complete settings table, and validation rules.
+description: Three-layer configuration precedence (env vars, TOML file, compiled defaults), the complete settings table (including the live-feed and Telegram keys), and validation rules.
 tags: [configuration, env-vars, toml]
 status: draft
 sources:
@@ -11,7 +11,7 @@ sources:
   - id: example-toml
     resource: /price-action.example.toml
     title: Example TOML config file
-generated: { by: pi-agent/use_this, at: 2026-09-17T14:35:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T14:22:52Z }
 ---
 
 Trading options resolve in strict precedence order — **environment variables
@@ -39,6 +39,12 @@ override the config file, which overrides compiled defaults**.[^config-src]
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ | Required when running normally with mode `live`; an empty/whitespace value is treated as absent and rejected in that case. Never needed for replay (see below). |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ | Secret — prefer the env var or a mounted secret over committing it to a file, and never commit it to the repo. Redacted in all debug output of `Config`. |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` | Only an env var; names where the config file (precedence layer 2) is read from. |
+| Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` | Bare hostname, **no scheme, path, userinfo (`@`) or whitespace**: `live` builds `wss://<host>/stocks` from it. Use `delayed.massive.com` for the 15-minute-delayed feed. Rejected when empty or when it contains whitespace or `/ : @ \`. Live-session only. See [Live Market-Data Session](live-market-data-session.md). |
+| Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` | `"minute"` (per-minute OHLCV windows, `AM.<SYM>`) or `"ticks"` (tick trades, `T.<SYM>`, aggregated into per-second bars). Case-insensitive and trimmed; any other value is rejected naming `live_feed_channel`. Live-session only. |
+| Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ | **Secret.** Required by the `live` subcommand (the feed is authenticated); never needed for replay or the no-args path. Prefer the env var or a mounted secret over committing it to a file. Redacted in all debug output of `Config`. |
+| Live session CSV directory | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` | Where `live` persists each session's bars as a replay-compatible CSV (`live-<SYMBOL>-<UTC stamp>.csv`, created if absent). Must not be empty. Nothing is written when a session saw no bars. |
+| Telegram bot token | `PRICE_ACTION_TELEGRAM_BOT_TOKEN` | `telegram_bot_token` | _(unset)_ | **Secret.** Optional. Redacted in all debug output of `Config`. See the both-or-neither rule below and [Telegram Notifications](telegram-notifications.md). |
+| Telegram chat id | `PRICE_ACTION_TELEGRAM_CHAT_ID` | `telegram_chat_id` | _(unset)_ | Optional; may be negative for a group or channel. Not a credential (it is shown in `Debug` and in delivery log lines). Must be paired with the token. |
 
 Semantics worth pinning down:
 
@@ -48,20 +54,32 @@ Semantics worth pinning down:
   (they may belong to other tooling sharing the process).
 - Unparseable env values (e.g. `PRICE_ACTION_QUANTITY=lots`) error naming the
   exact variable.
-- **`Config`'s `Debug` impl redacts `broker_api_key`** — formatting a config in
-  logs or test output can never leak the credential; all other fields remain
-  visible for diagnostics.[^config-src]
+- **`Config`'s `Debug` impl redacts all three credentials** —
+  `broker_api_key`, `massive_api_key` and `telegram_bot_token` each render as
+  `[redacted]` when present — so formatting a config in logs or test output can
+  never leak one; all other fields remain visible for diagnostics.[^config-src]
+- **Telegram delivery is both-or-neither.** With neither key set, daily
+  summaries go to the console only — a supported configuration, not an error.
+  With exactly one set, `live` fails fast naming the *missing* half (and never
+  echoing the value that is present), because a half-configured notifier is a
+  typo. The rule is enforced by `notify::TelegramNotifier::from_config`, not by
+  `Config`, so replay and the no-args path are unaffected.[^config-src]
 
-## The two load paths
+## The three load paths
 
 | Entry point | Used by | Validation | Notes |
 |---|---|---|---|
 | `Config::load()` | No-args binary path (normal run) | General **and** execution rules (live mode ⇒ non-empty `broker_url`) | Enforces everything a real run would. |
 | `Config::load_for_replay()` | The `replay` subcommand | General rules only; the live-mode `broker_url` requirement is skipped | Justified because replay executes on an in-memory `PaperBroker` and can never place orders; invalid symbol/quantity/threshold still refused. See [Replay Workflow](replay-workflow.md). |
+| `Config::load_for_live()` | The `live` subcommand | Everything `load()` enforces **plus** live-market-data rules: a non-empty `massive_api_key` must resolve | Justified because the feed is authenticated. It gates only `live` — replay and the no-args path never touch the feed, so they do not need a market-data key. Live *execution* remains unimplemented regardless of this path. See [Live Market-Data Session](live-market-data-session.md). |
 
-`Config::load_from(path, env)` (explicit file + injected env lookup) keeps
-full validation semantics and is the testing seam: every precedence rule above
-has a test built on it.[^config-src]
+General validation also covers the live-only keys on **every** path (a malformed
+`live_feed_host` or empty `live_csv_dir` is rejected even for a replay), so a
+typo cannot survive until the moment a session tries to connect.
+
+`Config::load_from(path, env)` and `Config::load_live_from(path, env)` (explicit
+file + injected env lookup) keep full validation semantics and are the testing
+seams: every precedence rule above has a test built on them.[^config-src]
 
 ## Updating configuration
 

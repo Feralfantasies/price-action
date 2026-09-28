@@ -1,8 +1,8 @@
 ---
 type: Reference
 title: OHLCV Bar File Format
-description: The CSV format replay consumes — header, column schema, Unix-second timestamps, validation rules, and lossless price round-trips.
-tags: [csv, data-format, replay]
+description: The CSV format replay consumes and live sessions persist — header, column schema, Unix-second timestamps, validation rules, and lossless price round-trips.
+tags: [csv, data-format, replay, live]
 status: draft
 sources:
   - id: csv-src
@@ -11,11 +11,23 @@ sources:
   - id: sample-csv
     resource: /samples/sample-bars.csv
     title: Bundled sample bar file
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+  - id: livers
+    resource: /src/live.rs
+    title: Live session source (persist_bars / session_csv_path)
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 Bar files are the data format consumed by `replay <bars.csv>` (see
 [Replay Workflow](replay-workflow.md)) and produced/consumed by `src/csv.rs`.[^csv-src]
+
+A [live session](live-market-data-session.md) **writes this same format**: on
+shutdown it persists every bar it consumed to
+`<live_csv_dir>/live-<SYMBOL>-<UTC stamp>.csv`, so the session can be re-replayed
+offline and reproduces exactly (both paths share one pipeline). One consequence
+worth knowing: a live-session CSV is a faithful record of the bars *that session
+saw*, gaps included — a `[feed gap: …]` annotation exists only in the live
+report's trace lines, not in the CSV, because a file has no way to know what
+never arrived.[^livers]
 
 ## Schema
 
@@ -84,3 +96,5 @@ under `samples/` (or similar) and document each file here plus in the repo's
 as it is for the [sample bar file](sample-bars.md).
 
 [^csv-src]: `src/csv.rs`: `HEADER`, `load_bars`/`save_bars` and the test module (header rejection, short rows, non-numeric + inf rejection, bit-exact round-trip)
+
+[^livers]: `src/live.rs`: `persist_bars` / `session_csv_path` (writes `csv::save_bars` output into `live_csv_dir`) and the re-replay reconciliation test

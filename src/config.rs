@@ -25,6 +25,10 @@ pub const DEFAULT_CONFIG_PATH: &str = "price-action.toml";
 /// Prefix of every environment variable this module reads.
 pub const ENV_PREFIX: &str = "PRICE_ACTION_";
 
+/// Directory `live` writes its persisted session CSVs into when neither the
+/// config file nor an environment var sets [`Config::live_csv_dir`].
+pub const DEFAULT_LIVE_CSV_DIR: &str = "./sessions";
+
 /// Lookup function for environment variables. Returns `None` for unset or
 /// empty values (an empty variable is treated as unset).
 pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
@@ -63,9 +67,9 @@ impl fmt::Display for Mode {
 
 /// Fully resolved application configuration.
 ///
-/// The [`fmt::Debug`] implementation is manual so that `broker_api_key` is
-/// always redacted — formatting a `Config` (logs, assertion failures) never
-/// exposes the credential.
+/// The [`fmt::Debug`] implementation is manual so that `broker_api_key`,
+/// `massive_api_key` and `telegram_bot_token` are always redacted — formatting
+/// a `Config` (logs, assertion failures) never exposes a credential.
 #[derive(Clone, PartialEq)]
 /// `Eq` intentionally absent: `Config` holds an f64 (`starting_balance`).
 pub struct Config {
@@ -92,6 +96,51 @@ pub struct Config {
     /// Broker API key. Prefer the environment variable or a mounted secret
     /// over committing it to a config file.
     pub broker_api_key: Option<String>,
+    /// Massive.com socket host for the `live` subcommand's market data (bare
+    /// hostname, no scheme): `socket.massive.com` (real-time) or
+    /// `delayed.massive.com` (15-minute delayed). Live-session only.
+    pub live_feed_host: String,
+    /// Native feed channel the live session consumes: `Minute` → per-minute
+    /// OHLCV windows (`AM.<SYMBOL>`, one bar per traded minute); `Ticks` →
+    /// tick trades (`T.<SYMBOL>`), aggregated locally into 1-second bars.
+    /// Defined in [`crate::feed`] (the module that speaks the wire).
+    pub live_feed_channel: crate::feed::FeedChannel,
+    /// Massive.com API key for the market-data feed. Secret — prefer the
+    /// environment variable over committing it to a config file.
+    pub massive_api_key: Option<String>,
+    /// Directory where `live` persists its session CSV; see
+    /// [`DEFAULT_LIVE_CSV_DIR`] (used when unset in every layer).
+    pub live_csv_dir: String,
+    /// Telegram bot token used to deliver daily summaries. Secret — prefer the
+    /// environment variable or a mounted secret over committing it to a file.
+    /// Optional: with neither Telegram setting present, summaries go to the
+    /// console only (see [`crate::notify::TelegramNotifier::from_config`]).
+    pub telegram_bot_token: Option<String>,
+    /// Telegram destination chat id for daily summaries (may be negative for a
+    /// group or channel). Not a credential, but meaningless without the token:
+    /// setting exactly one of the two is rejected as a configuration error.
+    pub telegram_chat_id: Option<String>,
+}
+
+/// Parses the configured live feed channel name.
+///
+/// The wire-facing enum lives in [`crate::feed`]; this free function is its
+/// `ConfigError`-aware parser (keeps string-parsing concerns with
+/// configuration).
+///
+/// # Errors
+///
+/// [`ConfigError::invalid`] naming `live_feed_channel` when `raw` is neither
+/// `"minute"` nor `"ticks"` (case-insensitive, trimmed).
+pub fn parse_feed_channel(raw: &str) -> Result<crate::feed::FeedChannel, ConfigError> {
+    match raw.to_ascii_lowercase().trim() {
+        "minute" => Ok(crate::feed::FeedChannel::Minute),
+        "ticks" => Ok(crate::feed::FeedChannel::Ticks),
+        other => Err(ConfigError::invalid(
+            "live_feed_channel",
+            format!("unknown channel {other:?}; expected \"minute\" or \"ticks\""),
+        )),
+    }
 }
 
 impl Default for Config {
@@ -107,6 +156,12 @@ impl Default for Config {
             trade_fee_bps: 5,
             broker_url: None,
             broker_api_key: None,
+            live_feed_host: "socket.massive.com".to_string(),
+            live_feed_channel: crate::feed::FeedChannel::Minute,
+            massive_api_key: None,
+            live_csv_dir: DEFAULT_LIVE_CSV_DIR.to_string(),
+            telegram_bot_token: None,
+            telegram_chat_id: None,
         }
     }
 }
@@ -126,6 +181,12 @@ struct FileConfig {
     trade_fee_bps: Option<u32>,
     broker_url: Option<String>,
     broker_api_key: Option<String>,
+    live_feed_host: Option<String>,
+    live_feed_channel: Option<String>,
+    massive_api_key: Option<String>,
+    live_csv_dir: Option<String>,
+    telegram_bot_token: Option<String>,
+    telegram_chat_id: Option<String>,
 }
 
 impl Config {
@@ -148,6 +209,32 @@ impl Config {
         let env = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
         let path = env(CONFIG_PATH_VAR).unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
         Self::load_into(Path::new(&path), &env, true)
+    }
+
+    /// Loads configuration for the `live` subcommand: everything
+    /// [`Config::load`] enforces, **plus** a resolvable market-data API key
+    /// (the feed is authenticated; data-only — no execution involved yet).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::load`], rejecting an absent/blank `massive_api_key`.
+    pub fn load_for_live() -> Result<Self, ConfigError> {
+        let env = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
+        let path = env(CONFIG_PATH_VAR).unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());
+        Self::load_live_from(Path::new(&path), &env)
+    }
+
+    /// Testing seam for [`Config::load_for_live`] on an explicit file path and
+    /// injected environment lookup; layering/validation semantics are
+    /// identical.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Config::load_for_live`].
+    pub fn load_live_from(path: &Path, env: EnvFn<'_>) -> Result<Self, ConfigError> {
+        let config = Self::load_into(path, env, true)?;
+        config.validate_live_market_data()?;
+        Ok(config)
     }
 
     /// Loads configuration for tool paths that never execute orders — e.g.
@@ -236,6 +323,25 @@ impl Config {
         if let Some(v) = file.broker_api_key {
             self.broker_api_key = Some(v);
         }
+        if let Some(v) = file.live_feed_host {
+            self.live_feed_host = v;
+        }
+        if let Some(v) = file.live_feed_channel {
+            self.live_feed_channel =
+                parse_feed_channel(&v).map_err(|e| ConfigError::file(path, e.to_string()))?;
+        }
+        if let Some(v) = file.massive_api_key {
+            self.massive_api_key = Some(v);
+        }
+        if let Some(v) = file.live_csv_dir {
+            self.live_csv_dir = v;
+        }
+        if let Some(v) = file.telegram_bot_token {
+            self.telegram_bot_token = Some(v);
+        }
+        if let Some(v) = file.telegram_chat_id {
+            self.telegram_chat_id = Some(v);
+        }
         Ok(())
     }
 
@@ -261,6 +367,24 @@ impl Config {
         }
         if let Some(v) = env("PRICE_ACTION_BROKER_API_KEY") {
             self.broker_api_key = Some(v);
+        }
+        if let Some(v) = env("PRICE_ACTION_LIVE_FEED_HOST") {
+            self.live_feed_host = v;
+        }
+        if let Some(raw) = env("PRICE_ACTION_LIVE_FEED_CHANNEL") {
+            self.live_feed_channel = parse_feed_channel(&raw)?;
+        }
+        if let Some(v) = env("PRICE_ACTION_MASSIVE_API_KEY") {
+            self.massive_api_key = Some(v);
+        }
+        if let Some(v) = env("PRICE_ACTION_LIVE_CSV_DIR") {
+            self.live_csv_dir = v;
+        }
+        if let Some(v) = env("PRICE_ACTION_TELEGRAM_BOT_TOKEN") {
+            self.telegram_bot_token = Some(v);
+        }
+        if let Some(v) = env("PRICE_ACTION_TELEGRAM_CHAT_ID") {
+            self.telegram_chat_id = Some(v);
         }
         Ok(())
     }
@@ -303,6 +427,31 @@ impl Config {
                 "must be a finite value greater than 0".into(),
             ));
         }
+        // The feed host is a bare hostname (no scheme, path, whitespace, or
+        // userinfo): `live` builds `wss://{host}/stocks` from it. A stray `@`
+        // would turn the prefix into URL userinfo that the WebSocket client
+        // parses as credentials, so reject it like any other non-hostname
+        // character.
+        if self.live_feed_host.trim().is_empty()
+            || self
+                .live_feed_host
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '/' | ':' | '@' | '\\'))
+        {
+            return Err(ConfigError::invalid(
+                "live_feed_host",
+                format!(
+                    "must be a bare hostname without scheme, path, userinfo (`@`) or whitespace (e.g. `socket.massive.com`); got {:?}",
+                    self.live_feed_host
+                ),
+            ));
+        }
+        if self.live_csv_dir.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "live_csv_dir",
+                "must not be empty (it names where live session CSVs are written)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -321,6 +470,24 @@ impl Config {
                 "broker_url",
                 "live mode requires a non-empty PRICE_ACTION_BROKER_URL or broker_url in the config file"
                     .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Live-market-data validation: the feed is authenticated, so a non-empty
+    /// API key must resolve (env or file). Separate from execution validation
+    /// because it gates only the `live` subcommand — replay and tool paths
+    /// never touch the feed.
+    fn validate_live_market_data(&self) -> Result<(), ConfigError> {
+        if self
+            .massive_api_key
+            .as_deref()
+            .is_none_or(|k| k.trim().is_empty())
+        {
+            return Err(ConfigError::invalid(
+                "massive_api_key",
+                "the live command needs a Massive.com API key: set PRICE_ACTION_MASSIVE_API_KEY or massive_api_key in the config file".into(),
             ));
         }
         Ok(())
@@ -346,6 +513,20 @@ impl fmt::Debug for Config {
                 "broker_api_key",
                 &self.broker_api_key.as_ref().map(|_| "[redacted]"),
             )
+            .field("live_feed_host", &self.live_feed_host)
+            .field("live_feed_channel", &self.live_feed_channel)
+            .field(
+                "massive_api_key",
+                &self.massive_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("live_csv_dir", &self.live_csv_dir)
+            .field(
+                "telegram_bot_token",
+                &self.telegram_bot_token.as_ref().map(|_| "[redacted]"),
+            )
+            // A chat id is not a credential (Telegram quotes it in its own
+            // errors) and it is what makes "is delivery configured?" legible.
+            .field("telegram_chat_id", &self.telegram_chat_id)
             .finish()
     }
 }
@@ -594,5 +775,91 @@ bar_interval_secs = 300
         let cfg = Config::load_from(&no_file(), &env_from(BTreeMap::new())).unwrap();
         let debug = format!("{cfg:?}");
         assert!(debug.contains("broker_api_key: None"), "{debug}");
+    }
+
+    #[test]
+    fn live_settings_defaults_and_layering() {
+        let cfg = Config::default();
+        assert_eq!(cfg.live_feed_host, "socket.massive.com");
+        assert_eq!(cfg.live_feed_channel, crate::feed::FeedChannel::Minute);
+        assert_eq!(cfg.live_csv_dir, DEFAULT_LIVE_CSV_DIR);
+        assert!(cfg.massive_api_key.is_none());
+
+        let path = write_temp_config(
+            r#"
+live_feed_host = "delayed.massive.com"
+live_feed_channel = "ticks"
+live_csv_dir = "/var/tmp/sessions"
+massive_api_key = "file-key"
+"#,
+        );
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_HOST", "socket.massive.com"),
+            ("PRICE_ACTION_MASSIVE_API_KEY", "env-key"),
+        ]));
+        let cfg = Config::load_live_from(&path, &env).unwrap();
+        assert_eq!(cfg.live_feed_host, "socket.massive.com"); // env beats file
+        assert_eq!(cfg.live_feed_channel, crate::feed::FeedChannel::Ticks); // file beats default
+        assert_eq!(cfg.live_csv_dir, "/var/tmp/sessions"); // file beats default
+        assert_eq!(cfg.massive_api_key.as_deref(), Some("env-key")); // env beats file
+
+        let cfg = Config::load_live_from(&path, &env_from(BTreeMap::new())).unwrap();
+        assert_eq!(cfg.live_feed_host, "delayed.massive.com");
+        assert_eq!(cfg.massive_api_key.as_deref(), Some("file-key"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn live_without_api_key_is_rejected_and_names_the_setting() {
+        let err = Config::load_live_from(&no_file(), &env_from(BTreeMap::new())).unwrap_err();
+        assert!(err.to_string().contains("massive_api_key"), "{err}");
+        // Blank key is treated as absent.
+        let env = env_from(BTreeMap::from([("PRICE_ACTION_MASSIVE_API_KEY", "   ")]));
+        let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("massive_api_key"), "{err}");
+    }
+
+    #[test]
+    fn live_feed_host_rejects_schemes_and_paths() {
+        for bad in [
+            "wss://socket.massive.com",
+            "socket.massive.com/stocks",
+            // `@` would decode as URL userinfo inside the built
+            // `wss://<host>/stocks` URL, so it is a non-hostname character.
+            "evil@socket.massive.com",
+            "user:pass@socket.massive.com",
+            "a b",
+        ] {
+            let env = env_from(BTreeMap::from([
+                ("PRICE_ACTION_LIVE_FEED_HOST", bad),
+                ("PRICE_ACTION_MASSIVE_API_KEY", "k"),
+            ]));
+            let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+            assert!(
+                err.to_string().contains("live_feed_host"),
+                "for {bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_feed_channel_is_rejected() {
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_CHANNEL", "candles"),
+            ("PRICE_ACTION_MASSIVE_API_KEY", "k"),
+        ]));
+        let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("live_feed_channel"), "{err}");
+    }
+
+    #[test]
+    fn debug_output_redacts_massive_api_key() {
+        let env = env_from(BTreeMap::from([(
+            "PRICE_ACTION_MASSIVE_API_KEY",
+            "feed-secret-value",
+        )]));
+        let cfg = Config::load_live_from(&no_file(), &env).unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("feed-secret-value"), "{debug}");
     }
 }
