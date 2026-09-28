@@ -51,6 +51,22 @@ jobs:
         with:
           components: clippy
 
+      # Runner-level sccache compiler cache. When its backend S3 object
+      # store (Garage) is down, sccache fails fast and the job dies before a
+      # single compile starts (connection refused → cargo exit 101). Probe
+      # once per job; if unreachable, clear RUSTC_WRAPPER for this job only
+      # (verified: an empty RUSTC_WRAPPER makes cargo skip invoking the
+      # wrapper entirely) and carry on uncached. A dead cache must slow CI
+      # down, never fail it.
+      - name: Prepare compiler cache (fall back to uncached if unreachable)
+        run: |
+          # only relevant when the runner wired sccache in as RUSTC_WRAPPER
+          case "${RUSTC_WRAPPER:-}" in *sccache*) ;; *) exit 0 ;; esac
+          if ! timeout 20 "$RUSTC_WRAPPER" --start-server; then
+            { echo "WARN: sccache backend unreachable — this job continues without the compiler cache"
+              echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"; }
+          fi
+
       - name: cargo clippy — deny all warnings
         run: cargo clippy --all-targets -- -D warnings
 
@@ -62,6 +78,17 @@ jobs:
     needs: [fmt, clippy]
     steps:
       - uses: actions/checkout@v6
+
+      # Runner-level sccache compiler cache — same probe as in the Clippy
+      # job: if its S3 backend (Garage) is unreachable, this job continues
+      # without the compiler cache instead of dying before compilation.
+      - name: Prepare compiler cache (fall back to uncached if unreachable)
+        run: |
+          case "${RUSTC_WRAPPER:-}" in *sccache*) ;; *) exit 0 ;; esac
+          if ! timeout 20 "$RUSTC_WRAPPER" --start-server; then
+            { echo "WARN: sccache backend unreachable — this job continues without the compiler cache"
+              echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"; }
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -88,6 +115,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
+
+      # Runner-level sccache compiler cache — same probe as in the Clippy
+      # job: if its S3 backend (Garage) is unreachable, this job continues
+      # without the compiler cache instead of dying before compilation.
+      - name: Prepare compiler cache (fall back to uncached if unreachable)
+        run: |
+          case "${RUSTC_WRAPPER:-}" in *sccache*) ;; *) exit 0 ;; esac
+          if ! timeout 20 "$RUSTC_WRAPPER" --start-server; then
+            { echo "WARN: sccache backend unreachable — this job continues without the compiler cache"
+              echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"; }
+          fi
 
       - name: cargo build — musl static target
         run: RUSTFLAGS="-D warnings" cargo build --release --target x86_64-unknown-linux-musl

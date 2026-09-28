@@ -14,7 +14,7 @@ sources:
   - id: release-yml
     resource: .github/workflows/release.yml
     title: Container build & release workflow
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T15:10:45Z }
 ---
 
 The project is built to run **`FROM scratch`** — the final image contains only
@@ -130,6 +130,17 @@ jobs use read-only contents permissions.[^ci-yml]
 | Build (musl static) | Builds for `x86_64-unknown-linux-musl` and asserts the binary is statically linked. |
 | Security Audit | `cargo-audit` against `Cargo.lock`. |
 | Trivy + Container | Builds the image and runs Trivy scans, including against the built scratch image. |
+
+**Compiler-cache resilience.** The firethorn runners wire cargo's compiler
+through a shared `sccache` (`RUSTC_WRAPPER`) with remote S3 storage (a LAN
+Garage server). While that backend is down, sccache fails fast at startup and
+every compiling job dies with cargo exit 101 *before* rustc runs — not a code
+problem. Each of the Clippy, Tests and Build jobs therefore probes once per
+job (`sccache --start-server` under a 20 s timeout); if the backend is
+unreachable the job clears `RUSTC_WRAPPER` for itself via `$GITHUB_ENV` (an
+*empty* value makes cargo skip wrapper invocation entirely) and carries on with
+a normal uncached compile. Healthy cache, unchanged behaviour; dead cache,
+slower CI but green.
 
 ## Release (`.github/workflows/release.yml`)
 
