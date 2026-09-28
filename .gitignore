@@ -1,1 +1,4 @@
 /target
+# Live sessions persist their bars here by default (`live_csv_dir`); they are
+# run artifacts, not fixtures — see docs/live-market-data-session.md.
+/sessions

@@ -10,8 +10,10 @@ symbol = "AAPL"
 # Shares/contracts per trade (>= 1).
 quantity = 1
 
-# "paper" (simulated, default) or "live" (requires broker_url; not yet
-# implemented).
+# "paper" (simulated, default) or "live" (requires broker_url; live EXECUTION
+# is not implemented — the binary refuses it). Note this key is about order
+# placement, not market data: the `live` subcommand streams real data while
+# still executing on the in-memory paper broker.
 mode = "paper"
 
 # Bar interval in seconds (>= 1).
@@ -37,3 +39,44 @@ trade_fee_bps = 5
 # Broker API key. Prefer the PRICE_ACTION_BROKER_API_KEY environment variable
 # or a mounted secret over putting credentials in this file.
 # broker_api_key = "..."
+
+# ---------------------------------------------------------------------------
+# Live market-data session (`price-action live`) — paper execution only.
+# These keys are read on every load path but only used by `live`.
+# ---------------------------------------------------------------------------
+
+# Massive.com socket host: a BARE hostname (no scheme, path or whitespace).
+# `live` builds wss://<host>/stocks from it.
+#   socket.massive.com   real-time
+#   delayed.massive.com  15-minute delayed
+live_feed_host = "socket.massive.com"
+
+# Which native feed channel to consume:
+#   "minute" — per-minute OHLCV windows (AM.<SYMBOL>), one bar per traded
+#              minute; the window in flight is held until the next one starts
+#              so the bar carries its FINAL numbers (bars lag ~1 minute).
+#   "ticks"  — tick trades (T.<SYMBOL>), aggregated locally into per-second bars.
+live_feed_channel = "minute"
+
+# Massive.com API key. SECRET — strongly prefer the
+# PRICE_ACTION_MASSIVE_API_KEY environment variable or a mounted secret over
+# committing it here. Required by `live`; never needed for replay.
+# massive_api_key = "..."
+
+# Directory where `live` writes each session's bars as a replay-compatible CSV
+# (live-<SYMBOL>-<UTC stamp>.csv), created if absent. Re-replay that file
+# offline to reproduce the session exactly.
+live_csv_dir = "./sessions"
+
+# ---------------------------------------------------------------------------
+# Telegram delivery of the live session's daily summaries — optional.
+# Both keys must be set together, or neither: with neither, summaries are
+# printed to the console only. The bot token is a SECRET — prefer
+# PRICE_ACTION_TELEGRAM_BOT_TOKEN.
+# ---------------------------------------------------------------------------
+
+# Bot token from @BotFather.
+# telegram_bot_token = "..."
+
+# Destination chat id (may be negative for a group or channel).
+# telegram_chat_id = "-1001234567890"

@@ -10,7 +10,15 @@
 Automated price-action trading in Rust: strategies driven by raw price
 movement (bars), not by derived indicators. A built-in **replay** mode lets
 you check how the configured strategy reacts to historic bar data before that
-strategy is trusted anywhere near real money — this is always step 1.
+strategy is trusted anywhere near real money — this is always step 1. A
+**live** mode then streams real-time bars from the Massive.com stocks
+WebSocket and paper-trades them against a funded fake balance, reporting each
+mock trade (size, committed notional, fees, running cash/equity) and
+summarizing every closed UTC day — optionally to Telegram.
+
+**Execution is paper-only in both modes.** The feed is data-in only and the
+only broker is in-memory, so there is no way for this program to place an
+order anywhere. "Live" describes the market data, never the execution.
 
 📚 Full documentation lives in an [Open Knowledge Format bundle](docs/index.md)
 under [`docs/`](docs/) — read it before changing anything, and see
@@ -26,7 +34,9 @@ same shared application engine + strategy used by every run — but
 ### 1. Build it locally
 
 The only requirement is [Rust](https://rustup.rs) (`rustup` installs it in one
-command); there are no other runtime or build dependencies:
+command), plus a C toolchain for the `ring` crypto provider that `rustls` uses
+for TLS (`cc` — present on most systems, and installed by the container's musl
+builder stage). There are no other runtime dependencies:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -41,9 +51,13 @@ git clone git@github.com:Feralfantasies/price-action.git
 cd price-action
 cargo run
 # price-action: symbol=AAPL mode=Paper quantity=1 bar_interval=60s threshold=3
-# price-action: engine ready, last signal = Flat (no market-data source configured yet)
-# hint: try `price-action replay samples/sample-bars.csv` for a worked example
+# price-action: engine ready, last signal = Flat (this path consumes no market data)
+# hint: `price-action replay samples/sample-bars.csv` for historic bars, or `price-action live` to stream real-time bars (paper execution either way)
 ```
+
+The binary has two subcommands: `replay <bars.csv>` (offline, step 1) and
+`live` (streaming, still paper execution). Anything else is rejected with
+`usage: price-action <replay <bars.csv> | live>` and exit code 1.
 
 ### 2. Replay the bundled sample data
 
@@ -106,12 +120,68 @@ How to read it:
   account cannot fund notes `(insufficient funds)` on that line instead.
 - Replay always executes on an in-memory `PaperBroker` regardless of the
   configured mode — it never places real orders, and there is still no live
-  execution path; the paper numbers are a priced simulation for review only.
+  *execution* path; the paper numbers are a priced simulation for review only.
   General configuration validation still runs before any bar is fed (invalid
   symbol, quantity or threshold are refused just like for a real run), but
   because paper-only execution needs no venue, replay takes a config path
   that skips the live-mode `broker_url` requirement — so no broker setup is
   ever needed to replay.
+
+### 2b. Watch it trade real data with fake money (`live`)
+
+Once replay has convinced you the settings behave, `live` runs the *same*
+engine, strategy and paper account against real-time market data from the
+Massive.com stocks WebSocket. It cannot place an order: the feed is data-in
+only.
+
+```sh
+PRICE_ACTION_SYMBOL=AAPL \
+PRICE_ACTION_MASSIVE_API_KEY=<your key> \
+  cargo run -- live
+# ...bars stream in; each closed paper trade prints the moment it closes:
+# [2021-01-19T18:00:00Z] MOCK TRADE #1 LONG  AAPL x1 entry=101 (2021-01-19) -> exit=100 (2021-01-20) | committed=101.00 fees=0.1005 (5 bps/side) gross P/L=-1.00 net P/L=-1.10 | cash=9998.90 equity=9998.90
+# Ctrl-C: flush, print the day's summary, render the full report, save the bars
+```
+
+What you get:
+
+- **Per-trade, in real time**: side, the configured `quantity`, entry/exit
+  prices with their UTC days, the notional **committed**, the **fees** with the
+  bps rate that produced them, gross and net P/L, and the running
+  **cash/equity**.
+- **A daily summary** at each UTC midnight and again at shutdown — bars,
+  entries, exits, fees paid, realized P/L net of fees, ending cash/equity and
+  any position still open. A quiet day still reports (zero activity, unchanged
+  balance).
+- **The full session report** on stop: the same per-bar trace, closed-trade
+  table, per-UTC-day totals and session totals replay prints, with `live` as
+  the source label.
+- **A persisted CSV** of every bar at `sessions/live-<SYMBOL>-<UTC stamp>.csv`,
+  replay-compatible — re-replay it offline and the trace reproduces exactly
+  (apart from live-only `[feed gap: …]` annotations, which a file cannot know
+  about).
+
+Two hosts are supported: `socket.massive.com` (real-time, the default) and
+`delayed.massive.com` (15-minute delayed). Two channels: `minute` (per-minute
+OHLCV windows, the default — bars lag ~1 minute because the window in flight is
+held until the next one starts, so it carries its *final* numbers) and `ticks`
+(aggregated locally into per-second bars).
+
+Add Telegram delivery of the daily summaries by setting **both** keys (with
+neither, summaries print to the console only; with exactly one, `live` fails
+fast naming the missing half):
+
+```sh
+PRICE_ACTION_MASSIVE_API_KEY=<key> \
+PRICE_ACTION_TELEGRAM_BOT_TOKEN=<bot token> \
+PRICE_ACTION_TELEGRAM_CHAT_ID=<chat id> \
+  cargo run -- live
+```
+
+Delivery failures are logged and the session keeps trading — a Telegram outage
+never costs market data. See
+[Live Market-Data Session](docs/live-market-data-session.md) and
+[Telegram Notifications](docs/telegram-notifications.md).
 
 ### 3. Verify how a setting changes behaviour
 
@@ -212,15 +282,18 @@ docker run --rm \
 | `src/execution.rs` | `Broker` trait and in-memory `PaperBroker` |
 | `src/engine.rs` | The trading loop: bar → signal → broker position |
 | `src/csv.rs` | OHLCV CSV reading/writing (the replay data format) |
-| `src/replay.rs` | Replay runner + human-readable report (trace, trades, day/session roll-ups) |
-| `src/accounting.rs` | Funded paper account for the replay report: fees, P/L, UTC-day bucketing |
+| `src/replay.rs` | Replay runner + `ReplaySession` (the per-bar pipeline both paths share) + human-readable report (trace, trades, day/session roll-ups) |
+| `src/accounting.rs` | Funded paper account for the report: fees, P/L, UTC-day bucketing |
+| `src/feed.rs` | Massive.com stocks WebSocket: framing, auth, subscribe, reconnect/backoff (transport only) |
+| `src/live.rs` | Live sessions: event → bar shaping, gap notes, session loop, daily summaries, CSV persistence |
+| `src/notify.rs` | Telegram delivery of daily summaries (`sendMessage` over rustls) |
 | `src/config.rs` | Layered configuration: env → config file → defaults |
 | `src/error.rs` | Shared error type |
 
-Market-data source adapters (broker/venue APIs, live feeds) are not part of the
-initial scaffold; replay is how you exercise the full pipeline offline until
-they exist. Live trading (`mode = "live"`) is also **not implemented yet** and
-the binary refuses to run it — paper only, by design, for now.
+Broker/venue adapters do not exist and are deliberately not planned in this
+scaffold: both data paths execute on the in-memory `PaperBroker`, so no order
+can be placed anywhere. Live *execution* (`mode = "live"`) is also **not
+implemented** and the binary refuses to run it — paper only, by design, for now.
 See [Overview](docs/overview.md) in the knowledge bundle for the authoritative
 pipeline diagram and current scope.
 
@@ -236,12 +309,15 @@ while `docs/` covers behaviour, formats, and rules.
 |---|---|
 | [Overview](docs/overview.md) | Architecture pipeline, current scope (paper-only), module map |
 | [Replay Workflow](docs/replay-workflow.md) | Verifying settings against historic bars; guarantees; A/B loops |
+| [Live Market-Data Session](docs/live-market-data-session.md) | The `live` subcommand: Massive.com WebSocket, bar shaping, gap notes, mock-trade log, daily summaries, persisted CSV |
 | [Trading Engine](docs/engine.md) | The bar → signal → position loop and its retry invariant |
 | [Consecutive Closes Strategy](docs/strategy-consecutive-closes.md) | The only shipping strategy: rule, state machine, tuning |
 | [Market Data Model](docs/market-data-model.md) | `Bar` (validated OHLCV) and the `BarSeries` rolling window |
 | [Execution Layer](docs/execution-layer.md) | `Broker` trait, `Position`, in-memory `PaperBroker` |
 | [OHLCV Bar File Format](docs/bar-file-format.md) | CSV schema, validation rules, lossless round-trips |
 | [Sample Bar File](docs/sample-bars.md) | The bundled synthetic 25-bar demo dataset (and its known output) |
+| [Paper Trading Accounting](docs/paper-trading-accounting.md) | How replay **and live sessions** price decisions: fees, P/L, UTC-day bucketing, session roll-ups |
+| [Telegram Notifications](docs/telegram-notifications.md) | Daily-summary delivery: config, the `sendMessage` request, secret handling, non-fail behaviour |
 | [Configuration](docs/configuration.md) | Precedence model, complete settings table, validation |
 | [Container Image & Release](docs/container-image-and-release.md) | `FROM scratch` rules (static + rustls), CI jobs, GHCR releases |
 | [Development Workflow](docs/development-workflow.md) | Toolchain, strict lint policy, verification commands, layout |
@@ -276,11 +352,21 @@ override the config file, which overrides compiled defaults**:
 | Paper trade fee (bps per side) | `PRICE_ACTION_TRADE_FEE_BPS` | `trade_fee_bps` | `5` |
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ |
+| Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` |
+| Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` |
+| Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ |
+| Live session CSV dir | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` |
+| Telegram bot token | `PRICE_ACTION_TELEGRAM_BOT_TOKEN` | `telegram_bot_token` | _(unset)_ |
+| Telegram chat id | `PRICE_ACTION_TELEGRAM_CHAT_ID` | `telegram_chat_id` | _(unset)_ |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` |
 
-Unknown config-file keys are rejected (typos fail fast). `live` mode requires
-`broker_url`; an empty variable is treated as unset. Prefer the environment or
-a mounted secret for `broker_api_key` rather than committing it to a file.
+Unknown config-file keys are rejected (typos fail fast). `live` **mode**
+(broker execution) requires `broker_url` and is not implemented; the `live`
+**subcommand** (market data) requires `massive_api_key` instead. An empty
+variable is treated as unset. Prefer the environment or a mounted secret for
+`broker_api_key`, `massive_api_key` and `telegram_bot_token` rather than
+committing them to a file — all three are redacted in any `Config` debug
+output.
 
 `PRICE_ACTION_SYMBOL`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic during
 replay (there are no orders). The remaining three all change what you see:
@@ -301,8 +387,11 @@ project self-contained enough for that:
   because `scratch` ships no libc.
 - **`rustls`, never OpenSSL.** Any crate that does TLS/HTTPS must be pure-Rust
   `rustls` with bundled `webpki` roots — `scratch` has no OpenSSL and no
-  CA-certificate store. When adding an HTTP client, depend on it like
-  larderly does:
+  CA-certificate store. This crate does TLS in two places (the live feed's
+  WebSocket and Telegram delivery), both pinned to `rustls` with the **`ring`**
+  provider and `webpki-roots`; `aws-lc-rs` is avoided because it needs
+  cmake/NASM and breaks the static musl cross-build. If you add a general HTTP
+  client, depend on it like larderly does:
 
   ```toml
   reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

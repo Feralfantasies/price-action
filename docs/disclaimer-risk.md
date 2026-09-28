@@ -8,7 +8,7 @@ sources:
   - id: disclaimer-md
     resource: /DISCLAIMER.md
     title: Full disclaimer document (governing text)
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 **This software is for educational and research purposes only and is not
@@ -26,11 +26,27 @@ docs, READMEs, or commits they change. Summary:
 - **Sample data is synthetic.** The [sample bar file](sample-bars.md) is shaped
   like real trades but is not exchange data; no result shown in this bundle is
   evidence of prospective performance.
-- **Paper-only by design, currently.** There is no live order path today — the
-  only broker is the in-memory `PaperBroker`, and the binary refuses to run
-  live mode even when configured (see [Overview](overview.md)). Any future live
-  execution must land behind configuration gates, on a human-decided review of
-  a PR, and must restate this disclaimer.
+- **Execution is paper-only by design, currently.** There is no live order path
+  today — the only broker is the in-memory `PaperBroker`, and the binary refuses
+  to run live *mode* even when configured (see [Overview](overview.md)). Any
+  future live execution must land behind configuration gates, on a
+  human-decided review of a PR, and must restate this disclaimer.
+- **Real data, fake money.** The `live` subcommand streams genuine real-time
+  market data and paper-trades it against a funded fake balance — see
+  [Live Market-Data Session](live-market-data-session.md). "Live" describes the
+  **data source only**; execution stays in memory and no order can be placed.
+  Its numbers are a priced simulation of what the configured strategy would
+  have done at the configured fee rate, with no slippage, no partial fills, no
+  venue minimums and no queue — they are **not** a track record, not evidence of
+  prospective performance, and not a claim that the strategy works.
+- **Data holes are reported, not hidden.** A live session annotates bars that
+  follow missing windows/ticks or a feed interruption, because a gap can change
+  what the strategy decided. Read those annotations before drawing any
+  conclusion from a session's totals.
+- **Delivered summaries carry the same framing.** A daily summary sent to
+  Telegram ends with "paper account only — no orders were placed, not financial
+  advice", precisely because it lands on a phone where the surrounding context
+  is gone (see [Telegram Notifications](telegram-notifications.md)).
 - **No liability.** The authors accept no liability for damages or trading
   losses.
 

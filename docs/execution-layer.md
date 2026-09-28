@@ -1,14 +1,17 @@
 ---
 type: Reference
 title: Execution Layer
-description: The Broker trait, Position enum, and the in-memory PaperBroker — the only broker implementation today.
+description: The Broker trait, Position enum, and the in-memory PaperBroker — still the only broker implementation, used by replay and live sessions alike.
 tags: [execution, broker, architecture]
 status: draft
 sources:
   - id: execution-src
     resource: /src/execution.rs
     title: Execution module source (impl + tests)
-generated: { by: pi-agent/use_this, at: 2026-09-16T23:15:00Z }
+  - id: livers
+    resource: /src/live.rs
+    title: Live session source (reuses ReplaySession, hence PaperBroker)
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 `execution.rs` defines the seam between decisions and order placement.[^execution-src]
@@ -34,9 +37,13 @@ must behave sensibly under repeated `set_position` calls for the same target**.
 
 In-memory placeholder: it only tracks its intended
 position, starting `Flat`, and always succeeds. It never places orders, models
-no costs, and keeps no fills history. It is what makes replay safe by design —
-replay always runs on a `PaperBroker` regardless of configured mode
-(see [Replay Workflow](replay-workflow.md)).
+no costs, and keeps no fills history. It is what makes both data paths safe by
+design — replay always runs on a `PaperBroker` regardless of configured mode
+(see [Replay Workflow](replay-workflow.md)), and a
+[live session](live-market-data-session.md) runs the *same* `ReplaySession`, so
+it inherits the same `PaperBroker`. Streaming real market data therefore adds
+no order path: the feed is data-in only, and there is still no way for this
+program to place a trade anywhere.[^livers]
 
 | API | Meaning |
 |---|---|
@@ -60,3 +67,5 @@ adapter lands it:
    can run) — see [Bundle Update Guide](bundle-update-guide.md).
 
 [^execution-src]: `src/execution.rs` module and test: paper broker tracks position through set_position calls
+
+[^livers]: `src/live.rs`: `SessionState::new` builds a `ReplaySession`, which constructs `Engine<ConsecutiveCloses, PaperBroker>`; `src/feed.rs` has no execution surface at all (no `Broker` import, no send path other than auth/subscribe frames)

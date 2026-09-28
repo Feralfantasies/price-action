@@ -9,6 +9,26 @@ license = "MIT"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+# Explicit rustls dependency: tokio-tungstenite's `rustls-tls-webpki-roots`
+# enables the *root certificates* but not a crypto provider, and rustls 0.23
+# panics inside `ClientConfig::builder()` when no provider is selected.
+# `ring` is chosen over the `aws_lc_rs` default because the binary is built
+# `FROM scratch` as a static musl image (docs/container-image-and-release.md):
+# ring cross-builds to musl with plain `cc`, aws-lc-rs needs cmake/NASM.
+# No OpenSSL/native-tls anywhere — that rule is binding for this repo.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# Telegram delivery (src/notify.rs) over HTTPS. Both crates are ALREADY in the
+# tree via tokio-tungstenite's `rustls-tls-webpki-roots` feature, so pinning
+# them here adds no new transitive dependency — deliberate, because this crate
+# ships as a static musl binary `FROM scratch` and an HTTP stack like reqwest
+# would pull in hyper/tower plus a second TLS provider.
+# `webpki-roots` supplies the bundled CA store (scratch has no /etc/ssl/certs).
+tokio-rustls = { version = "0.26.5", default-features = false }
+webpki-roots = "0.26.11"
+futures-util = "0.3.34"
+serde_json = "1.0.151"
 
 [workspace.lints.clippy]
 # Pedantic lints enforce careful, idiomatic code. Kept as deny; instances are

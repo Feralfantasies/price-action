@@ -1,8 +1,8 @@
 ---
 type: Reference
 title: Paper Trading Accounting
-description: How the replay report prices the strategy's decisions as a funded paper account — execution model, flat basis-point fees per side, insufficient-funds skipping, UTC-day bucketing and session roll-ups.
-tags: [replay, accounting, paper-trading, fees, p/l]
+description: How the replay report — and the live session — price the strategy's decisions as a funded paper account: execution model, flat basis-point fees per side, insufficient-funds skipping, UTC-day bucketing and session roll-ups.
+tags: [replay, live, accounting, paper-trading, fees, p/l]
 status: draft
 sources:
   - id: accountingsrc
@@ -11,7 +11,10 @@ sources:
   - id: configsrc
     resource: /src/config.rs
     title: Config knobs that feed the account (starting_balance, trade_fee_bps)
-generated: { by: pi-agent/use_this, at: 2026-09-17T14:30:00Z }
+  - id: liversrc
+    resource: /src/live.rs
+    title: Live session source (same account, daily summaries)
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 The replay report is not a passive signal trace: it also runs each bar's
@@ -21,10 +24,21 @@ closed trade, per-UTC-day totals and session totals. Replay remains read-only
 by design — the account exists only to *report* what the strategy's decisions
 would have cost or earned.[^accountingsrc]
 
+**This is the same account a [live session](live-market-data-session.md)
+trades.** Both paths feed bars into one `ReplaySession`, so every rule below
+applies identically whether the bars came from a CSV file or from a WebSocket;
+that is exactly why re-replaying a session's persisted CSV reproduces it. A
+live session adds two things on top, without changing any pricing rule: a
+mock-trade log line per close (quantity, committed notional, per-side fees with
+the bps rate, gross/net P/L, running cash/equity) and a
+[`DailySummary`](telegram-notifications.md) per closed UTC day.[^liversrc]
+
 All money is `f64` (validated finite upstream by configuration), shown at two
 decimals in the report; any field labelled *net* already includes fees. The
 model deliberately has **no leverage beyond** the configured `quantity`,
-**no slippage** beyond the flat fee rate, and **no persistence**.
+**no slippage** beyond the flat fee rate, and **no persistence of the account
+itself** — a live session persists its *bars* (so the run is reproducible), but
+the account state is rebuilt by re-replaying them rather than stored.
 
 ## Two settings feed the account
 
@@ -100,10 +114,19 @@ shape in [Replay Workflow](replay-workflow.md)):[^accountingsrc]
 This is a teaching-grade cost model for reviewing settings, not a broker
 simulation: fills are always at the bar close (no intrabar slippage or
 partial fills), position sizing is the fixed `quantity` only (no margining,
-pyramiding or stop-losses), fees ignore venue minimums/tiers, and nothing is
-written to disk. It also cannot represent a venue rejecting an order for any
-reason other than lack of account funds — which replay has no reason to model.
+pyramiding or stop-losses), fees ignore venue minimums/tiers, and no account
+state is written to disk. It also cannot represent a venue rejecting an order
+for any reason other than lack of account funds — which neither path has any
+reason to model, because neither can reach a venue.
+
+A live session inherits every one of those limits, and adds one of its own:
+its bars arrive with **holes** (missing windows/ticks, feed interruptions),
+which are annotated in the trace but *not* simulated as market conditions. So
+a live session's totals are only as good as the data that arrived — read the
+`[feed gap: …]` annotations before trusting them.
 
 [^accountingsrc]: `src/accounting.rs`: state machine in `PaperAccount::on_bar`, `exit_position`, equity mark, day arithmetic, and the test module with hand-computed reference values (long/short round trips, reversal, zero-fee exactness, insufficient-funds path, known UTC dates)
 
 [^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0) and `trade_fee_bps` (unsigned bps) in all three precedence layers with error-naming tests
+
+[^liversrc]: `src/live.rs`: `SessionState::new` (constructs the same `ReplaySession`/`PaperAccount`), `log_mock_trade`, `DayAccumulator::record` (entries counted as funded position openings, matching `per_day_totals`), and the reconciliation test asserting a live day's summary equals the report's per-UTC-day roll-up

@@ -1,7 +1,7 @@
 ---
 type: Playbook
 title: Replay Workflow
-description: The sanctioned workflow for verifying how the configured strategy reacts to historic bars — replay is read-only by design.
+description: The sanctioned workflow for verifying how the configured strategy reacts to historic bars — replay is read-only by design, and shares its per-bar pipeline with the live session.
 tags: [replay, verification, workflow]
 status: draft
 sources:
@@ -17,7 +17,7 @@ sources:
   - id: mainrs
     resource: /src/main.rs
     title: Binary entry-point source
-generated: { by: pi-agent/use_this, at: 2026-09-17T14:30:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
 ---
 
 Replay answers the question *"do these settings behave the way I expect on
@@ -62,7 +62,24 @@ cargo run -- replay samples/sample-bars.csv
 
 The `replay` subcommand takes **exactly one argument** (the bar-file path).
 A bare `replay`, extra arguments, or any other first argument are rejected with
-a usage error and exit code 1.[^mainrs]
+a usage error and exit code 1. `live` is the only other subcommand and takes no
+arguments; the shared usage line is
+`usage: price-action <replay <bars.csv> | live>`.[^mainrs]
+
+### The same pipeline, a different data source
+
+Replay's per-bar pipeline lives in `ReplaySession`, which is **the** source of
+truth for per-bar behaviour: offline replay feeds a recorded file into one
+finished session, and the
+[live session](live-market-data-session.md) feeds streamed bars into the same
+type. Entries, exits, fees, collateral, skips, cash/equity marks, roll-ups and
+trace lines therefore come from one implementation in both paths — a live
+session's persisted CSV re-replays to a byte-identical trace (apart from the
+live-only `[feed gap: …]` annotations, which a file cannot know about).
+
+The only difference in the rendering is the `source` label in the report's first
+line: `render_report(config, report, "replay", out)` versus `"live"`. Every
+other line, table and total is produced by the same code.[^replayrs]
 
 ### Expected shape of the output
 
@@ -194,8 +211,17 @@ the config path used by replay must be reflected in this document, in
 entry appended to [`log.md`](log.md) in the same pull request; see
 [Bundle Update Guide](bundle-update-guide.md).
 
+Because `ReplaySession` is shared, **a change to per-bar behaviour is also a
+change to the live session**: update
+[Live Market-Data Session](live-market-data-session.md) and
+[Paper Trading Accounting](paper-trading-accounting.md) in the same PR, and
+re-check the live/re-replay reconciliation test rather than only the replay
+expected-output blocks.
+
 [^readme]: README.md quick-start and configuration sections
 
-[^replayrs]: `src/replay.rs` module doc: "Replay is read-only by design"
+[^replayrs]: `src/replay.rs` module doc: "Replay is read-only by design"; and `ReplaySession` doc ("the single source of truth for per-bar behaviour": offline replay and the live session feed the same type), plus `annotate_last_trace` and `render_report(config, report, source, out)`
 
-[^mainrs]: `src/main.rs`: strict argv matching and replay config path
+[^accountingsrc]: `src/accounting.rs`: state machine in `PaperAccount::on_bar`, `exit_position`, equity mark, day arithmetic, and the test module with hand-computed reference values
+
+[^mainrs]: `src/main.rs`: strict argv matching (`replay` / `live`), the shared `USAGE` line, and the replay config path

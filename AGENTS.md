@@ -16,14 +16,18 @@ to this repo.
 start at [`docs/index.md`](docs/index.md), then at minimum:
 
 1. [Overview](docs/overview.md) — what the project is, its pipeline, and its
-   current scope (paper-only, no market-data adapters).
+   scope (paper-only **execution**; market data is either replayed from a CSV
+   or streamed live from the Massive.com WebSocket).
 2. [Configuration](docs/configuration.md) — the three-layer precedence model
    and every setting.
 3. [Replay Workflow](docs/replay-workflow.md) — how strategy behaviour is
    verified against historic bars; replay is read-only by design.
 
 Then read the concept documents relevant to your change (engine, strategy,
-bar format, container/CI, development workflow). **Do not guess current
+bar format, container/CI, development workflow) — and
+[Live Market-Data Session](docs/live-market-data-session.md) plus
+[Telegram Notifications](docs/telegram-notifications.md) for anything touching
+the `live` subcommand. **Do not guess current
 behaviour from memory or from stale README snippets — the bundle plus the
 source of record (`src/*.rs`, `Cargo.toml`, workflows) is authoritative.** If
 the bundle and the code disagree, treat that as an incident: re-verify against
@@ -52,6 +56,11 @@ review comment to yourself: *did this change touch a documented surface?*
   replays or signals as profitable, validated, or recommendations — this is
   educational software and the [disclaimer](docs/disclaimer-risk.md) is load-
   bearing (keep `README.md`'s top disclaimer and the bundle consistent).
+  ⚠️ Do not confuse the `live` **subcommand** with `mode = "live"`: the
+  subcommand streams real market data but still executes on the in-memory
+  `PaperBroker` and cannot place an order. "Live" always describes the *data*,
+  never the execution — keep that distinction in every doc, log line and
+  commit message you write.
 - **Scratch image constraints.** The container is `FROM scratch`: keep binaries
   statically linked (`x86_64-unknown-linux-musl`) and TLS on **`rustls` with
   bundled roots, never OpenSSL/`native-tls`** ([Container Image & Release](docs/container-image-and-release.md)).
