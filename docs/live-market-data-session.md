@@ -20,7 +20,7 @@ sources:
   - id: configsrc
     resource: /src/config.rs
     title: Live-session configuration keys and load_for_live validation
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T14:22:52Z }
 ---
 
 `price-action live` answers a different question from
@@ -113,7 +113,11 @@ wrong close, wrong high/low, wrong volume. Consequences:
 **Tick mode (`live_feed_channel = "ticks"`).** Trades accumulate into a bucket
 per UTC second — first price is the open, last is the close, high/low widen,
 size sums — and the bucket becomes a bar when a trade from a *different* second
-arrives (or on flush).
+arrives (or on flush). A tick that arrives with a timestamp **older** than the
+second currently accumulating is out-of-order and is **dropped**: it emits no
+older bar, and closing or replacing the held bucket on its arrival would have
+to truncate that bucket's true high/low/volume — the same rule minute mode
+applies to out-of-order windows.[^livers]
 
 **Data holes are reported, never hidden.** A jump of ≥ 1 full minute between
 windows annotates the *next* bar with `[feed gap: ~<n>s of missing windows
@@ -127,7 +131,11 @@ arrive *before* the first bar cannot be attached to anything and are counted
 and reported on stderr instead.[^livers][^replayrs]
 
 Unusable values (non-finite or negative price/volume) are rejected with
-`Error::MarketData` rather than silently booked into the account.[^livers]
+`Error::MarketData` rather than silently booked into the account. Inside the
+session loop such a shaping failure **drops the offending event only** — one
+line on stderr and the feed keeps flowing (the same posture as the feeder
+skipping unparseable frames); errors raised *after* a bar is shaped — i.e. by
+`ReplaySession::on_bar` booking it — still end the session.[^livers]
 
 ## One session, one shared pipeline
 

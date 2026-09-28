@@ -11,7 +11,7 @@ sources:
   - id: example-toml
     resource: /price-action.example.toml
     title: Example TOML config file
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T14:22:52Z }
 ---
 
 Trading options resolve in strict precedence order — **environment variables
@@ -39,7 +39,7 @@ override the config file, which overrides compiled defaults**.[^config-src]
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ | Required when running normally with mode `live`; an empty/whitespace value is treated as absent and rejected in that case. Never needed for replay (see below). |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ | Secret — prefer the env var or a mounted secret over committing it to a file, and never commit it to the repo. Redacted in all debug output of `Config`. |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` | Only an env var; names where the config file (precedence layer 2) is read from. |
-| Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` | Bare hostname, **no scheme, path or whitespace**: `live` builds `wss://<host>/stocks` from it. Use `delayed.massive.com` for the 15-minute-delayed feed. Rejected when empty or when it contains whitespace or `/ : \`. Live-session only. See [Live Market-Data Session](live-market-data-session.md). |
+| Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` | Bare hostname, **no scheme, path, userinfo (`@`) or whitespace**: `live` builds `wss://<host>/stocks` from it. Use `delayed.massive.com` for the 15-minute-delayed feed. Rejected when empty or when it contains whitespace or `/ : @ \`. Live-session only. See [Live Market-Data Session](live-market-data-session.md). |
 | Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` | `"minute"` (per-minute OHLCV windows, `AM.<SYM>`) or `"ticks"` (tick trades, `T.<SYM>`, aggregated into per-second bars). Case-insensitive and trimmed; any other value is rejected naming `live_feed_channel`. Live-session only. |
 | Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ | **Secret.** Required by the `live` subcommand (the feed is authenticated); never needed for replay or the no-args path. Prefer the env var or a mounted secret over committing it to a file. Redacted in all debug output of `Config`. |
 | Live session CSV directory | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` | Where `live` persists each session's bars as a replay-compatible CSV (`live-<SYMBOL>-<UTC stamp>.csv`, created if absent). Must not be empty. Nothing is written when a session saw no bars. |

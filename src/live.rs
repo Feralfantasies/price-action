@@ -308,9 +308,19 @@ impl BarShaper {
             return Ok(Vec::new());
         }
 
-        // A different second: close the held bucket. A jump of ≥2s means at
+        if ts_secs < bucket.ts_secs {
+            // Out-of-order delivery from before the second in flight: the
+            // session already traded a later second. Emitting it would book
+            // an older bar after a newer one, and closing the held bucket on
+            // its arrival would truncate that second's true high/low/volume
+            // — so the tick is stale and dropped (matching the minute-mode
+            // rule for out-of-order windows).
+            return Ok(Vec::new());
+        }
+
+        // A later second: close the held bucket. A jump of ≥2s means at
         // least one traded second was missed → honest gap note; adjacent
-        // seconds (and backward/out-of-order repeats) carry none.
+        // seconds carry none.
         let gap_note = gap_note_for_seconds(bucket.ts_secs, ts_secs);
         self.tick_bucket = Some(TickBucket {
             ts_secs,
@@ -721,10 +731,20 @@ pub async fn run_session(
                         }
                     }
                     other => {
-                        for shaped in shaper.on_event(other)? {
-                            if let Some(summary) = state.consume(shaped, config)? {
-                                deliver_summary(&summaries, summary).await;
+                        // One unshapable event must not end the whole live
+                        // session: log it and keep consuming (mirrors the
+                        // feeder skipping unparseable frames). Errors from
+                        // `consume` — the account actually booking a bar —
+                        // still propagate.
+                        match shaper.on_event(other) {
+                            Ok(shaped_bars) => {
+                                for shaped in shaped_bars {
+                                    if let Some(summary) = state.consume(shaped, config)? {
+                                        deliver_summary(&summaries, summary).await;
+                                    }
+                                }
                             }
+                            Err(e) => eprintln!("live session: dropping event: {e}"),
                         }
                     }
                 }
@@ -1027,6 +1047,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_ticks_are_dropped_and_never_replace_the_active_bucket() {
+        let mut shaper = BarShaper::new_ticks();
+        // Second 1 accumulates two trades…
+        shaper.on_event(tick(1_000, 100.0, 1.0)).unwrap();
+        shaper.on_event(tick(1_500, 101.0, 2.0)).unwrap();
+        // …an out-of-order arrival from second 0 must not close the bucket
+        // into an older bar or replace it.
+        assert!(shaper.on_event(tick(900, 42.0, 7.0)).unwrap().is_empty());
+        let flushed = shaper.flush().unwrap();
+        assert_eq!(flushed.len(), 1);
+        let bar = flushed[0].bar;
+        // The held second-1 bucket is intact: open/close/high/low/volume are
+        // exactly the two in-second trades, not the stale one.
+        assert_eq!(
+            unix_secs(bar.timestamp()),
+            1,
+            "the stale tick must not move the active second"
+        );
+        assert!((bar.open() - 100.0).abs() < f64::EPSILON);
+        assert!((bar.close() - 101.0).abs() < f64::EPSILON);
+        assert!((bar.high() - 101.0).abs() < f64::EPSILON);
+        assert!((bar.low() - 100.0).abs() < f64::EPSILON);
+        assert!((bar.volume() - 3.0).abs() < f64::EPSILON,);
+    }
+
+    #[test]
     fn cross_mode_events_and_interruptions_make_no_bars() {
         let mut minute = BarShaper::new_minute();
         assert!(minute.on_event(tick(1_000, 100.0, 1.0)).unwrap().is_empty());
@@ -1133,6 +1179,16 @@ mod tests {
         }
     }
 
+    /// Default config, ticks channel (the shaper mode exercised by the
+    /// session-loop resilience tests), temp CSV dir.
+    fn tick_channel_config(dir: &Path) -> Config {
+        Config {
+            live_feed_channel: FeedChannel::Ticks,
+            live_csv_dir: dir.display().to_string(),
+            ..Config::default()
+        }
+    }
+
     #[tokio::test]
     async fn a_session_shapes_events_into_a_report_and_persists_them() {
         let dir = std::env::temp_dir().join("price-action-live-test-session");
@@ -1190,6 +1246,53 @@ mod tests {
         assert_eq!(rerun.trace_lines, stripped);
         assert_eq!(rerun.entries, output.report.entries);
         assert_eq!(rerun.closed_trades.len(), output.report.closed_trades.len());
+        std::fs::remove_file(&csv_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unusable_events_are_dropped_and_the_session_continues() {
+        let dir = std::env::temp_dir().join("price-action-live-test-badevent");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = tick_channel_config(&dir);
+
+        let (tx, rx) = mpsc::channel::<RawEvent>(EVENT_CHANNEL_SIZE);
+        // A tick whose `consume` booking succeeds…
+        tx.send(tick(1_000, 100.0, 1.0)).await.unwrap();
+        // …an unusable event (non-finite price) must not end the session…
+        tx.send(tick(2_000, f64::NAN, 1.0)).await.unwrap();
+        // …and later, valid ticks are still shaped and booked.
+        tx.send(tick(3_000, 101.0, 1.0)).await.unwrap();
+        tx.send(tick(4_000, 102.0, 1.0)).await.unwrap();
+        drop(tx); // closes the channel → the session ends
+
+        let (output, summaries) = run_collecting(&config, rx, std::future::pending::<()>()).await;
+        // The three good ticks land in seconds 1, 3 and 4 — one bar each,
+        // the last flushed at shutdown; the NaN tick produced none and did
+        // not abort the loop.
+        assert_eq!(
+            output.report.bars, 3,
+            "the bad event must not end the session"
+        );
+        assert_eq!(output.bars_written, 3);
+        assert_eq!(summaries.len(), 1, "{summaries:?}");
+
+        let csv_path = output.csv_path.clone().unwrap();
+        let bars = csv::load_bars(&csv_path).unwrap();
+        assert_eq!(bars.len(), 3);
+        // Second 2 never held a usable trade, so its bar is absent and the
+        // hole is reported, not hidden.
+        let secs: Vec<i64> = bars.iter().map(|bar| unix_secs(bar.timestamp())).collect();
+        assert_eq!(secs, vec![1, 3, 4]);
+        assert!((bars[2].close() - 102.0).abs() < f64::EPSILON);
+        assert!(
+            output
+                .report
+                .trace_lines
+                .iter()
+                .any(|line| line.contains("feed gap")),
+            "missing second must carry a gap note in {:?}",
+            output.report.trace_lines
+        );
         std::fs::remove_file(&csv_path).unwrap();
     }
 

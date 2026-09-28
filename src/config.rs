@@ -427,18 +427,21 @@ impl Config {
                 "must be a finite value greater than 0".into(),
             ));
         }
-        // The feed host is a bare hostname (no scheme/whitespace): `live`
-        // builds `wss://{host}/stocks` from it.
+        // The feed host is a bare hostname (no scheme, path, whitespace, or
+        // userinfo): `live` builds `wss://{host}/stocks` from it. A stray `@`
+        // would turn the prefix into URL userinfo that the WebSocket client
+        // parses as credentials, so reject it like any other non-hostname
+        // character.
         if self.live_feed_host.trim().is_empty()
             || self
                 .live_feed_host
                 .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '/' | ':' | '\\'))
+                .any(|c| c.is_whitespace() || matches!(c, '/' | ':' | '@' | '\\'))
         {
             return Err(ConfigError::invalid(
                 "live_feed_host",
                 format!(
-                    "must be a bare hostname without scheme or path (e.g. `socket.massive.com`); got {:?}",
+                    "must be a bare hostname without scheme, path, userinfo (`@`) or whitespace (e.g. `socket.massive.com`); got {:?}",
                     self.live_feed_host
                 ),
             ));
@@ -821,6 +824,10 @@ massive_api_key = "file-key"
         for bad in [
             "wss://socket.massive.com",
             "socket.massive.com/stocks",
+            // `@` would decode as URL userinfo inside the built
+            // `wss://<host>/stocks` URL, so it is a non-hostname character.
+            "evil@socket.massive.com",
+            "user:pass@socket.massive.com",
             "a b",
         ] {
             let env = env_from(BTreeMap::from([
