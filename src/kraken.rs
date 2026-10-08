@@ -28,6 +28,12 @@
 //!   every supported input form — display pair (`BTC/USD`), legacy wsname
 //!   (`XBT/USD`), altname (`XBTUSD`) or internal key (`XXBTZUSD`) — into the
 //!   two canonical names both endpoints need. Public endpoints: no secrets.
+//! - Every probed public reply arrives **`Transfer-Encoding: chunked`**
+//!   (observed live on 2026-10-08, with `OHLC` and `AssetPairs` bodies
+//!   spanning more than one data-chunk), so [`decode_rest_reply`] first
+//!   reassembles the RFC 9112 §7.1 framing to a plain body — the hex size
+//!   markers between chunks would otherwise corrupt a brace-bracketed JSON
+//!   read. Non-chunked replies pass through unchanged.
 //! - Spot WebSocket v2: `wss://ws.kraken.com/v2`. Public channels — including
 //!   OHLC — need **no authentication** (the authenticated endpoint is a
 //!   different host, deliberately not used here). Subscribe with
@@ -429,7 +435,9 @@ where
     stream.flush().await.map_err(|e| {
         crate::error::Error::MarketData(format!("cannot flush the kraken REST request: {e}"))
     })?;
-    // `Connection: close` means the response ends at EOF.
+    // `Connection: close` means the raw reply ends at EOF; whether the body
+    // itself is chunk-framed (the Kraken CDN answers chunked in practice) is
+    // a wire rule owned by `decode_rest_reply`, which reassembles it.
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.map_err(|e| {
         crate::error::Error::MarketData(format!("cannot read the kraken REST response: {e}"))
@@ -482,22 +490,127 @@ fn status_text(response: &str) -> String {
         .to_string()
 }
 
-/// The JSON envelope of an HTTP response: the outermost `{ … }` in whatever
-/// follows the header block. Tolerant of both `Content-Length` and a chunked
-/// body (the braces bracket Kraken's JSON either way).
-fn json_envelope(response: &str) -> Option<&str> {
-    let body = match response.split_once("\r\n\r\n") {
-        Some((_head, body)) => body,
-        None => response.split_once("\n\n").map_or(response, |(_h, b)| b),
-    };
-    let start = body.find('{')?;
-    let end = body.rfind('}')?;
-    if end < start {
-        return None;
+/// The response's header block and its raw body — tolerant of both CRLF and
+/// bare-LF terminators (the leniency the envelope reader has always had); when
+/// a separator is missing altogether, the whole text reads as body with an
+/// empty header so a headerless reply still decodes.
+#[must_use]
+fn header_and_body(response: &str) -> (&str, &str) {
+    match response.split_once("\r\n\r\n") {
+        Some((head, body)) => (head, body),
+        None => response
+            .split_once("\n\n")
+            .map_or(("", response), |(h, b)| (h, b)),
     }
-    // `get` rather than a slice expression: out-of-range reads should read as
-    // "no body", and the panic lints forbid slicing outside tests.
-    body.get(start..=end)
+}
+
+/// True when the header block declares `Transfer-Encoding: chunked` on any of
+/// its comma-separated tokens — case-insensitive either side (header lines are
+/// ASCII per RFC 9112 §5, so a lowered scan is exact). Other transfer codings
+/// are not understood by this client and read as ordinary bodies.
+#[must_use]
+fn transport_chunked(head: &str) -> bool {
+    let lowered = head.to_ascii_lowercase();
+    for line in lowered.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() == "transfer-encoding"
+            && value.split(',').any(|part| part.trim() == "chunked")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Reassembles one `Transfer-Encoding: chunked` body into its payload bytes
+/// per RFC 9112 §7.1: a `<hex-size>[;extension]` size line (CRLF-terminated),
+/// then exactly that many data bytes followed by their own CRLF — repeated,
+/// with the final size zero; any trailers after it are ignored (Kraken sends
+/// none). The walk works in **bytes** so UTF-8 sequences split across chunks
+/// keep their exact length.
+///
+/// Returns `None` on malformed framing — a size line missing its newline, an
+/// empty or non-hex token where the size belongs, a chunk claim that overruns
+/// the buffer, or the CRLF after the data bytes missing — so a broken body is
+/// reported as unusable rather than guessed at.
+#[allow(clippy::arithmetic_side_effects)] // bounded framing walk (same policy as `parse_candles`)
+fn unchunk_chunk(body: &[u8]) -> Option<Vec<u8>> {
+    let mut payload = Vec::new();
+    let mut pos: usize = 0;
+    loop {
+        // Size line: from `pos` up to the next LF (a size token cannot hold one).
+        let rest_at_pos = body.get(pos..)?;
+        let Some(rel) = rest_at_pos.iter().position(|&b| b == b'\n') else {
+            return None; // truncated mid-size-line
+        };
+        let lf = pos + rel;
+        let line = body.get(pos..lf)?;
+
+        // A CRLF-framed size line ends in a CR: strip at most one — the token
+        // then runs from line start to any `;` extension (which goes to end of
+        // line and is ignored; this API uses none). The token is upper- or
+        // lowercase hex digits; any other byte is invalid framing.
+        let token_end = if line.last() == Some(&b'\r') {
+            line.len().saturating_sub(1)
+        } else {
+            line.len()
+        };
+        let token = line.get(0..token_end)?;
+
+        let mut size: u64 = 0;
+        let mut saw_digit = false;
+        for &c in token {
+            match c {
+                b';' => break, // extension: the rest of the line is unused here
+                b'0'..=b'9' => {
+                    size = size.checked_mul(16)?.checked_add(u64::from(c - b'0'))?;
+                }
+                b'a'..=b'f' => {
+                    size = size
+                        .checked_mul(16)?
+                        .checked_add(u64::from(c - b'a') + 10)?;
+                }
+                b'A'..=b'F' => {
+                    size = size
+                        .checked_mul(16)?
+                        .checked_add(u64::from(c - b'A') + 10)?;
+                }
+                _ => return None, // non-hex in the size token: malformed
+            }
+            saw_digit = true;
+        }
+        if !saw_digit {
+            return None; // an empty (`;…`) token is not a size line
+        }
+
+        let data_len = usize::try_from(size).ok()?; // also guards 32-bit hosts
+        let rest = body.get(lf + 1..)?;
+        // The chunk (plus its framing CRLF, for a data-carrying chunk) must fit
+        // in the buffer — checked additively so a hostile size claim cannot
+        // wrap a bound.
+        if data_len.saturating_add(2) > rest.len() {
+            return None; // the chunk (plus its framing CRLF) overruns the buffer
+        }
+        let data = rest.get(..data_len)?;
+        payload.extend_from_slice(data);
+
+        // A final (zero-size) chunk has no data bytes of its own: after its size
+        // line an optional trailer block may run to end of body and is ignored
+        // by design, so nothing more is verifiable — break before the data-
+        // CRLF check that applies to real chunks only.
+        if size == 0 {
+            break;
+        }
+        if !matches!(rest.get(data_len), Some(b'\r'))
+            || !matches!(rest.get(data_len + 1), Some(b'\n'))
+        {
+            return None; // the framing CRLF after the chunk data is missing
+        }
+        pos = lf + 1 + data_len + 2;
+    }
+    Some(payload)
 }
 
 /// One public REST GET, decoded to JSON — or an error naming what went wrong.
@@ -511,15 +624,23 @@ async fn get_json(path_query: &str) -> Result<Value, crate::error::Error> {
     decode_rest_reply(&text, path_query)
 }
 
-/// Decodes one kraken HTTP response: status-line check, envelope extraction and
-/// the Kraken business-error array. Pure over text — the seam unit tests drive
-/// with captured bodies (no network needed).
+/// Decodes one kraken HTTP response: status-line check, chunked-body
+/// reassembly (when the CDN declares it), envelope extraction and the Kraken
+/// business-error array. Pure over text — the seam unit tests drive with
+/// captured replies, multi-chunk frames included (no network needed).
+///
+/// Every probed endpoint is answered `Transfer-Encoding: chunked` by the CDN
+/// in front of Kraken (verified live on 2026-10-08, some bodies spanning more
+/// than one data-chunk), and the hex size markers between chunks would corrupt
+/// a brace-bracketed extraction of the document — so chunked replies are first
+/// reassembled to their plain form. Non-chunked replies pass through unchanged.
 ///
 /// # Errors
 ///
 /// [`crate::error::Error::MarketData`] on a non-2xx status (quoted), a body
-/// without a JSON envelope, or a non-empty `error` array (first message quoted —
-/// Kraken's own strings name the offending input and carry no credentials).
+/// whose chunked framing cannot be reassembled, a body without a JSON
+/// envelope, or a non-empty `error` array (first message quoted — Kraken's own
+/// strings name the offending input and carry no credentials).
 fn decode_rest_reply(response: &str, path_query: &str) -> Result<Value, crate::error::Error> {
     if !matches!(status_line_is_success(response), Some(true)) {
         return Err(crate::error::Error::MarketData(format!(
@@ -527,11 +648,41 @@ fn decode_rest_reply(response: &str, path_query: &str) -> Result<Value, crate::e
             status_text(response)
         )));
     }
-    let envelope = json_envelope(response).ok_or_else(|| {
-        crate::error::Error::MarketData(format!(
+
+    let (head, raw_body) = header_and_body(response);
+    let body_text = if transport_chunked(head) {
+        let payload = unchunk_chunk(raw_body.as_bytes()).ok_or_else(|| {
+            crate::error::Error::MarketData(format!(
+                "kraken REST `{path_query}` used a chunked framing this client cannot reassemble"
+            ))
+        })?;
+        String::from_utf8(payload).map_err(|e| {
+            crate::error::Error::MarketData(format!(
+                "the de-chunked kraken REST body of `{path_query}` was not valid UTF-8 ({} bytes unusable)",
+                e.utf8_error().error_len().unwrap_or(0)
+            ))
+        })?
+    } else {
+        raw_body.to_string()
+    };
+
+    // `get` rather than slice expressions: out-of-range reads should read as
+    // "no body", and the panic lints forbid slicing outside tests.
+    let Some((start, end)) = body_text.find('{').zip(body_text.rfind('}')) else {
+        return Err(crate::error::Error::MarketData(format!(
             "kraken REST `{path_query}` returned no JSON envelope in its body"
-        ))
-    })?;
+        )));
+    };
+    if end < start {
+        return Err(crate::error::Error::MarketData(format!(
+            "kraken REST `{path_query}` returned no JSON envelope in its body"
+        )));
+    }
+    let Some(envelope) = body_text.get(start..=end) else {
+        return Err(crate::error::Error::MarketData(format!(
+            "kraken REST `{path_query}` returned no JSON envelope in its body"
+        )));
+    };
     let value: Value = serde_json::from_str(envelope).map_err(|e| {
         crate::error::Error::MarketData(format!("cannot parse the kraken JSON reply: {e}"))
     })?;
@@ -1433,6 +1584,131 @@ mod tests {
         let no_json = http200("<html>proxy failure</html>");
         let err = decode_rest_reply(&no_json, "/0/public/OHLC").unwrap_err();
         assert!(err.to_string().contains("no JSON envelope"), "{err}");
+    }
+
+    // ── chunked reassembly: regression fixture captured from the live wire ───
+
+    // Captured from `GET /0/public/OHLC?pair=XBTUSD&interval=5` on
+    // 2026-10-08 (17:25 UTC): the CDN answered `Transfer-Encoding: chunked`
+    // over 2 chunks (sizes ['4ab9', '97f4']). The framed body below is the same
+    // capture trimmed to its 30 most recent rows and re-framed into three
+    // chunks with the cuts inside row data, so a brace-bracketed read of
+    // the raw reply cannot parse it.
+    const CAPTURED_CHUNKED_BODY: &str = "3e2\r\n{\"error\":[],\"result\":{\"XXBTZUSD\":[[1791471600,\"82644.8\",\"82644.8\",\"82438.4\",\"82439.1\",\"82547.6\",\"17.27394136\",786],[1791471900,\"82439.1\",\"82439.1\",\"82310.6\",\"82336.4\",\"82382.2\",\"15.63584811\",868],[1791472200,\"82336.4\",\"82356.3\",\"82106.5\",\"82106.5\",\"82267.8\",\"43.59248533\",916],[1791472500,\"82103.6\",\"82163.7\",\"81813.1\",\"81931.4\",\"81980.9\",\"31.98256985\",1186],[1791472800,\"81939.8\",\"82004.9\",\"81277.4\",\"81485.4\",\"81548.8\",\"155.40119834\",2855],[1791473100,\"81485.5\",\"81642.2\",\"81222.1\",\"81289.5\",\"81410.5\",\"52.37053599\",1590],[1791473400,\"81297.5\",\"81497.3\",\"81141.8\",\"81141.8\",\"81343.6\",\"79.31785952\",1808],[1791473700,\"81146.5\",\"81241.2\",\"80909.0\",\"81241.2\",\"81062.7\",\"75.00715213\",2374],[1791474000,\"81246.2\",\"81255.7\",\"81074.6\",\"81172.5\",\"81144.8\",\"21.05425385\",1225],[1791474300,\"81166.9\",\"81373.7\",\"81097.5\",\"81373.6\",\"81206.1\",\"55.64419372\",1581],[1791474600,\"81373.7\",\"81463.9\",\"81115.9\",\"81141.8\",\"81334.8\",\"11.49263499\",1207],[1791474900,\"81141.7\",\"81225.5\",\"80934.4\",\"80977.9\",\"81012.0\r\n366\r\n\",\"29.65802059\",1390],[1791475200,\"80967.7\",\"81148.7\",\"80806.8\",\"80976.8\",\"80955.5\",\"64.49616742\",1650],[1791475500,\"80983.2\",\"81088.4\",\"80732.8\",\"81069.7\",\"80889.2\",\"67.80869534\",1586],[1791475800,\"81068.1\",\"81206.2\",\"80945.8\",\"80960.1\",\"81160.0\",\"45.36451387\",1226],[1791476100,\"80960.1\",\"81368.1\",\"80872.5\",\"81281.9\",\"81167.0\",\"58.25845305\",1531],[1791476400,\"81283.5\",\"81374.0\",\"81187.8\",\"81267.5\",\"81258.4\",\"37.93081471\",1187],[1791476700,\"81267.5\",\"81372.7\",\"81228.3\",\"81242.4\",\"81277.8\",\"9.68813647\",902],[1791477000,\"81242.4\",\"81293.1\",\"81035.9\",\"81202.5\",\"81174.9\",\"13.14837703\",1239],[1791477300,\"81201.8\",\"81316.2\",\"81177.7\",\"81315.7\",\"81222.2\",\"6.79081728\",951],[1791477600,\"81311.4\",\"81390.0\",\"81193.8\",\"81223.1\",\"81295.3\",\"9.08262945\",876],[1791477900,\"81223.1\",\"81313.3\",\"80964.5\",\"80968.3\",\"81170.9\",\"11.12846977\",1161],[1791478200,\"80968.2\",\"81042.1\",\"8\r\n26e\r\n0896.6\",\"81019.7\",\"80961.6\",\"17.12718090\",1184],[1791478500,\"81014.2\",\"81033.5\",\"80802.9\",\"80893.2\",\"80899.6\",\"22.30955096\",1180],[1791478800,\"80893.2\",\"80951.6\",\"80666.0\",\"80756.7\",\"80788.7\",\"80.93718606\",2091],[1791479100,\"80756.0\",\"80813.5\",\"80617.0\",\"80754.0\",\"80694.4\",\"28.39804499\",1281],[1791479400,\"80745.9\",\"80905.9\",\"80658.1\",\"80863.0\",\"80778.8\",\"29.08902158\",1147],[1791479700,\"80857.0\",\"80873.8\",\"80689.1\",\"80759.2\",\"80807.4\",\"10.46037598\",1078],[1791480000,\"80754.4\",\"80754.4\",\"80400.0\",\"80458.4\",\"80533.3\",\"78.71944319\",1848],[1791480300,\"80458.3\",\"80519.6\",\"80435.2\",\"80471.4\",\"80461.1\",\"5.37721424\",147]]}}\r\n0\r\n\r\n";
+    const CAPTURED_MARKET_KEY: &str = "XXBTZUSD";
+    const CAPTURED_FIRST_TS: u64 = 1_791_471_600;
+    const CAPTURED_FIRST_CLOSE: &str = "82439.1";
+    const CAPTURED_LAST_TS: u64 = 1_791_480_300;
+    const CAPTURED_LAST_CLOSE: &str = "80471.4";
+    const CAPTURED_ROW_COUNT: usize = 30;
+
+    #[test]
+    fn captured_chunked_reply_reassembles_to_parseable_candles() {
+        // The raw framed body is NOT valid JSON as a brace-bracketed read: the
+        // hex size markers inside it corrupt exactly what the old envelope
+        // extraction used — this pins the failure mode that sank the first real
+        // backtest run (`cannot parse the kraken JSON reply`, line 2).
+        let start = CAPTURED_CHUNKED_BODY.find('{');
+        let end = CAPTURED_CHUNKED_BODY.rfind('}');
+        assert!(start.is_some() && end.is_some());
+        if let (Some(s), Some(e)) = (start, end) {
+            let bracketed = CAPTURED_CHUNKED_BODY.get(s..=e).expect("bracket range");
+            assert!(serde_json::from_str::<Value>(bracketed).is_err());
+        }
+
+        // ...and the full reply through the real decode path: chunk reassembly
+        // yields a document `parse_candles` accepts end to end.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Date: captured-fixture\r\n\
+             Content-Type: application/json\r\n\
+             Transfer-Encoding: chunked\r\n\
+             Connection: close\r\n\
+             \r\n{CAPTURED_CHUNKED_BODY}"
+        );
+        let value = decode_rest_reply(&response, "/0/public/OHLC").expect("chunked reply decodes");
+
+        // All 30 captured rows are committed by this `now` (the last window ends
+        // at 1_791_480_600 seconds); the anchors were read off independently
+        // computed values from the same capture, not from this code.
+        let bars = parse_candles(&value, 300, 1_791_480_601).expect("all rows committed");
+        assert_eq!(bars.len(), CAPTURED_ROW_COUNT);
+
+        // The reply must also carry the market's internal key — resolution and
+        // candles agree on the same market they were fetched for.
+        let market_key = value
+            .get("result")
+            .and_then(Value::as_object)
+            .and_then(|obj| obj.keys().next())
+            .map(String::as_str);
+        assert_eq!(market_key, Some(CAPTURED_MARKET_KEY));
+
+        let first = bars.first().expect("a bar");
+        assert_eq!(
+            first
+                .timestamp()
+                .duration_since(UNIX_EPOCH)
+                .expect("post-epoch fixture")
+                .as_secs(),
+            CAPTURED_FIRST_TS
+        );
+        let first_close: f64 = CAPTURED_FIRST_CLOSE.parse().expect("const is numeric");
+        assert!((first.close() - first_close).abs() < f64::EPSILON);
+
+        let last = bars.last().expect("a bar");
+        assert_eq!(
+            last.timestamp()
+                .duration_since(UNIX_EPOCH)
+                .expect("post-epoch fixture")
+                .as_secs(),
+            CAPTURED_LAST_TS
+        );
+        let last_close: f64 = CAPTURED_LAST_CLOSE.parse().expect("const is numeric");
+        assert!((last.close() - last_close).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn chunked_detection_reads_the_header_case_insensitively_among_tokens() {
+        assert!(transport_chunked("Transfer-Encoding: chunked"));
+        assert!(transport_chunked("transfer-encoding: Chunked"));
+        assert!(transport_chunked(
+            "X-Others: a\r\nTransfer-Encoding: identity, chunked"
+        ));
+        assert!(!transport_chunked(
+            "Content-Type: application/json\r\nTransfer-Encoding: gzip"
+        ));
+        assert!(!transport_chunked(""));
+    }
+
+    #[test]
+    fn malformed_chunk_framings_are_rejected_not_guessed_at() {
+        // Sized `&[u8]` elements: byte-string literals of different lengths in
+        // one array would otherwise fight over the inferred element type.
+        let cases: [&[u8]; 5] = [
+            b"1abc",                              // truncated before the size line completes
+            b"zz\r\nabcd\r\n0\r\n\r\n",           // non-hex size token
+            b";ext=1\r\n0\r\n\r\n",               // extension-only (empty) size token
+            b"ff\r\nten bytes only\r\n0\r\n\r\n", // the size claim overruns the buffer
+            b"3\r\nabc0\r\n\r\n",                 // no CRLF after the data bytes
+        ];
+        for bad in cases {
+            assert!(unchunk_chunk(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn chunked_walk_reassembles_multi_chunk_payloads_and_ignores_trailers() {
+        // Sizes verified against the literals (`hello wo` is eight bytes, `rld`
+        // is three): two framed data-chunks whose payloads join back to one
+        // document, then a zero chunk with a trailer block the walk must ignore.
+        let plain = unchunk_chunk(b"8\r\nhello wo\r\n3\r\nrld\r\n0\r\nX-Trail: yes\r\n\r\n")
+            .expect("reassembly");
+        assert_eq!(plain, b"hello world");
+
+        // An uppercase size token (`B` = eleven) framing exactly that many data
+        // bytes — the other case of RFC 9112 §7.1's hex-size grammar.
+        let plain = unchunk_chunk(b"B\r\nabcdefghijk\r\n0\r\n\r\n").expect("reassembly");
+        assert_eq!(plain, b"abcdefghijk");
     }
 
     // ── candles: shaping rules over the captured 12-row body ─────────────────
