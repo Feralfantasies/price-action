@@ -65,6 +65,35 @@ impl fmt::Display for Mode {
     }
 }
 
+/// Where the `live` subcommand's market data comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeedSource {
+    /// Massive.com stocks WebSocket (authenticated). The default.
+    #[default]
+    Massive,
+    /// Kraken Spot WebSocket **v2** public OHLC channel — no authentication
+    /// exists for it and none is used; like every other path in this crate it
+    /// can only supply data, never place an order.
+    Kraken,
+}
+
+/// Parses the configured live feed source name (case-insensitive, trimmed).
+///
+/// # Errors
+///
+/// [`ConfigError::invalid`] naming `live_feed_source` when `raw` is neither
+/// `"massive"` nor `"kraken"`.
+pub fn parse_feed_source(raw: &str) -> Result<FeedSource, ConfigError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "massive" => Ok(FeedSource::Massive),
+        "kraken" => Ok(FeedSource::Kraken),
+        other => Err(ConfigError::invalid(
+            "live_feed_source",
+            format!("unknown feed source {other:?}; expected \"massive\" or \"kraken\""),
+        )),
+    }
+}
+
 /// Fully resolved application configuration.
 ///
 /// The [`fmt::Debug`] implementation is manual so that `broker_api_key`,
@@ -105,6 +134,13 @@ pub struct Config {
     /// tick trades (`T.<SYMBOL>`), aggregated locally into 1-second bars.
     /// Defined in [`crate::feed`] (the module that speaks the wire).
     pub live_feed_channel: crate::feed::FeedChannel,
+    /// Where `live` gets its market data from: [`FeedSource::Massive`] (the
+    /// authenticated stocks WebSocket, needs `massive_api_key`) or
+    /// [`FeedSource::Kraken`] (public Spot WebSocket v2 OHLC channel — no key;
+    /// minute-granular windows only, so `live_feed_channel` must be `"minute"`
+    /// and `bar_interval_secs` must name one of Kraken's candle intervals). Live-session
+    /// only.
+    pub live_feed_source: FeedSource,
     /// Massive.com API key for the market-data feed. Secret — prefer the
     /// environment variable over committing it to a config file.
     pub massive_api_key: Option<String>,
@@ -158,6 +194,7 @@ impl Default for Config {
             broker_api_key: None,
             live_feed_host: "socket.massive.com".to_string(),
             live_feed_channel: crate::feed::FeedChannel::Minute,
+            live_feed_source: FeedSource::Massive,
             massive_api_key: None,
             live_csv_dir: DEFAULT_LIVE_CSV_DIR.to_string(),
             telegram_bot_token: None,
@@ -183,6 +220,7 @@ struct FileConfig {
     broker_api_key: Option<String>,
     live_feed_host: Option<String>,
     live_feed_channel: Option<String>,
+    live_feed_source: Option<String>,
     massive_api_key: Option<String>,
     live_csv_dir: Option<String>,
     telegram_bot_token: Option<String>,
@@ -330,6 +368,10 @@ impl Config {
             self.live_feed_channel =
                 parse_feed_channel(&v).map_err(|e| ConfigError::file(path, e.to_string()))?;
         }
+        if let Some(v) = file.live_feed_source {
+            self.live_feed_source =
+                parse_feed_source(&v).map_err(|e| ConfigError::file(path, e.to_string()))?;
+        }
         if let Some(v) = file.massive_api_key {
             self.massive_api_key = Some(v);
         }
@@ -373,6 +415,9 @@ impl Config {
         }
         if let Some(raw) = env("PRICE_ACTION_LIVE_FEED_CHANNEL") {
             self.live_feed_channel = parse_feed_channel(&raw)?;
+        }
+        if let Some(raw) = env("PRICE_ACTION_LIVE_FEED_SOURCE") {
+            self.live_feed_source = parse_feed_source(&raw)?;
         }
         if let Some(v) = env("PRICE_ACTION_MASSIVE_API_KEY") {
             self.massive_api_key = Some(v);
@@ -475,20 +520,44 @@ impl Config {
         Ok(())
     }
 
-    /// Live-market-data validation: the feed is authenticated, so a non-empty
-    /// API key must resolve (env or file). Separate from execution validation
-    /// because it gates only the `live` subcommand — replay and tool paths
-    /// never touch the feed.
+    /// Live-market-data validation, per selected source: Massive requires a
+    /// resolvable API key (env or file); Kraken uses public endpoints and needs
+    /// no secrets, but offers only minute-granular OHLC windows — it rejects
+    /// the ticks channel, and `bar_interval_secs` is then the candle length it
+    /// subscribes to, which must be one of Kraken's allowed intervals.
+    /// Separate from execution validation because it gates only the `live`
+    /// subcommand — replay and tool paths never touch the feed.
     fn validate_live_market_data(&self) -> Result<(), ConfigError> {
-        if self
-            .massive_api_key
-            .as_deref()
-            .is_none_or(|k| k.trim().is_empty())
-        {
-            return Err(ConfigError::invalid(
-                "massive_api_key",
-                "the live command needs a Massive.com API key: set PRICE_ACTION_MASSIVE_API_KEY or massive_api_key in the config file".into(),
-            ));
+        match self.live_feed_source {
+            FeedSource::Massive => {
+                if self
+                    .massive_api_key
+                    .as_deref()
+                    .is_none_or(|k| k.trim().is_empty())
+                {
+                    return Err(ConfigError::invalid(
+                        "massive_api_key",
+                        "the live command needs a Massive.com API key: set PRICE_ACTION_MASSIVE_API_KEY or massive_api_key in the config file".into(),
+                    ));
+                }
+            }
+            FeedSource::Kraken => {
+                if self.live_feed_channel == crate::feed::FeedChannel::Ticks {
+                    return Err(ConfigError::invalid(
+                        "live_feed_channel",
+                        "the Kraken source provides minute-granular OHLC windows; live_feed_channel must be \"minute\"".into(),
+                    ));
+                }
+                let interval = u32::try_from(self.bar_interval_secs).map_err(|_| {
+                    ConfigError::invalid(
+                        "bar_interval_secs",
+                        "too large to name a Kraken candle interval".into(),
+                    )
+                })?;
+                // Same rule both Kraken endpoints accept; names the allowed set.
+                crate::kraken::validate_interval_secs(interval)
+                    .map_err(|e| ConfigError::invalid("bar_interval_secs", e.to_string()))?;
+            }
         }
         Ok(())
     }
@@ -515,6 +584,7 @@ impl fmt::Debug for Config {
             )
             .field("live_feed_host", &self.live_feed_host)
             .field("live_feed_channel", &self.live_feed_channel)
+            .field("live_feed_source", &self.live_feed_source)
             .field(
                 "massive_api_key",
                 &self.massive_api_key.as_ref().map(|_| "[redacted]"),
@@ -861,5 +931,85 @@ massive_api_key = "file-key"
         let cfg = Config::load_live_from(&no_file(), &env).unwrap();
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("feed-secret-value"), "{debug}");
+    }
+
+    #[test]
+    fn feed_source_names_parse_case_insensitively() {
+        assert!(matches!(
+            parse_feed_source("massive"),
+            Ok(FeedSource::Massive)
+        ));
+        assert!(
+            matches!(parse_feed_source("  KRAKEN "), Ok(FeedSource::Kraken)),
+            "trimmed + case-insensitive"
+        );
+        let err = parse_feed_source("binance").unwrap_err();
+        assert!(err.to_string().contains("live_feed_source"), "{err}");
+    }
+
+    #[test]
+    fn live_feed_source_defaults_to_massive_and_layers_file_and_env() {
+        let cfg = Config::load_from(&no_file(), &env_from(BTreeMap::new())).unwrap();
+        assert_eq!(cfg.live_feed_source, FeedSource::Massive);
+
+        // Config file.
+        let path = write_temp_config("live_feed_source = \"kraken\"\n");
+        let cfg = Config::load_live_from(&path, &env_from(BTreeMap::new())).unwrap();
+        assert_eq!(cfg.live_feed_source, FeedSource::Kraken);
+        std::fs::remove_file(&path).ok();
+
+        // Env over file. The resolved source becomes Massive, whose live-load
+        // path validates its API key — a dummy supplies one so this test
+        // exercises layering, not validation (the per-source tests below own
+        // that behaviour).
+        let path = write_temp_config("live_feed_source = \"kraken\"\n");
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_SOURCE", "massive"),
+            ("PRICE_ACTION_MASSIVE_API_KEY", "dummy-layering-test"),
+        ]));
+        let cfg = Config::load_live_from(&path, &env).unwrap();
+        assert_eq!(cfg.live_feed_source, FeedSource::Massive);
+        std::fs::remove_file(&path).ok();
+
+        // Unknown value is rejected naming the setting.
+        let env = env_from(BTreeMap::from([(
+            "PRICE_ACTION_LIVE_FEED_SOURCE",
+            "bitfinex",
+        )]));
+        let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("live_feed_source"), "{err}");
+    }
+
+    #[test]
+    fn kraken_source_needs_no_key_but_validates_channel_and_candle_interval() {
+        // Public endpoints: no API key exists or is read, so `live` loads
+        // without one at a valid candle length (60s is the default).
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_SOURCE", "kraken"),
+            ("PRICE_ACTION_SYMBOL", "BTC/USD"),
+            ("PRICE_ACTION_BAR_INTERVAL_SECS", "300"),
+        ]));
+        assert!(Config::load_live_from(&no_file(), &env).is_ok());
+
+        // The Kraken OHLC channel is minute-granular: no tick equivalent.
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_SOURCE", "kraken"),
+            ("PRICE_ACTION_SYMBOL", "BTC/USD"),
+            ("PRICE_ACTION_LIVE_FEED_CHANNEL", "ticks"),
+        ]));
+        let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("live_feed_channel"), "{err}");
+
+        // An arbitrary bar interval is not a Kraken candle length.
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_LIVE_FEED_SOURCE", "kraken"),
+            ("PRICE_ACTION_SYMBOL", "BTC/USD"),
+            ("PRICE_ACTION_BAR_INTERVAL_SECS", "7"),
+        ]));
+        let err = Config::load_live_from(&no_file(), &env).unwrap_err();
+        assert!(err.to_string().contains("bar_interval_secs"), "{err}");
+
+        // The default Massive gate is untouched: it still asks for its key.
+        assert!(Config::load_live_from(&no_file(), &env_from(BTreeMap::new())).is_err());
     }
 }

@@ -11,10 +11,12 @@ Automated price-action trading in Rust: strategies driven by raw price
 movement (bars), not by derived indicators. A built-in **replay** mode lets
 you check how the configured strategy reacts to historic bar data before that
 strategy is trusted anywhere near real money — this is always step 1. A
-**live** mode then streams real-time bars from the Massive.com stocks
-WebSocket and paper-trades them against a funded fake balance, reporting each
-mock trade (size, committed notional, fees, running cash/equity) and
-summarizing every closed UTC day — optionally to Telegram.
+**live** mode then streams real-time bars — from the Massive.com stocks
+WebSocket (the default, authenticated) or Kraken's public Spot WebSocket v2
+OHLC channel (`live_feed_source = "kraken"`, no key) — and paper-trades them
+against a funded fake balance, reporting each mock trade (size, committed
+notional, fees, running cash/equity) and summarizing every closed UTC day —
+optionally to Telegram.
 
 **Execution is paper-only in both modes.** The feed is data-in only and the
 only broker is in-memory, so there is no way for this program to place an
@@ -130,13 +132,20 @@ How to read it:
 ### 2b. Watch it trade real data with fake money (`live`)
 
 Once replay has convinced you the settings behave, `live` runs the *same*
-engine, strategy and paper account against real-time market data from the
-Massive.com stocks WebSocket. It cannot place an order: the feed is data-in
-only.
+engine, strategy and paper account against real-time market data — from the
+Massive.com stocks WebSocket (the default, authenticated) or Kraken's public
+Spot WebSocket v2 OHLC channel, which needs no key. It cannot place an order
+either way: the feed is data-in only.
 
 ```sh
+# Massive.com (the default source) — authenticated
 PRICE_ACTION_SYMBOL=AAPL \
 PRICE_ACTION_MASSIVE_API_KEY=<your key> \
+  cargo run -- live
+# Kraken Spot (public crypto candles) — no key exists for it and none is read
+PRICE_ACTION_LIVE_FEED_SOURCE=kraken \
+PRICE_ACTION_SYMBOL=XBT/USD \
+PRICE_ACTION_BAR_INTERVAL_SECS=60 \
   cargo run -- live
 # ...bars stream in; each closed paper trade prints the moment it closes:
 # [2021-01-19T18:00:00Z] MOCK TRADE #1 LONG  AAPL x1 entry=101 (2021-01-19) -> exit=100 (2021-01-20) | committed=101.00 fees=0.1005 (5 bps/side) gross P/L=-1.00 net P/L=-1.10 | cash=9998.90 equity=9998.90
@@ -161,11 +170,14 @@ What you get:
   (apart from live-only `[feed gap: …]` annotations, which a file cannot know
   about).
 
-Two hosts are supported: `socket.massive.com` (real-time, the default) and
-`delayed.massive.com` (15-minute delayed). Two channels: `minute` (per-minute
-OHLCV windows, the default — bars lag ~1 minute because the window in flight is
-held until the next one starts, so it carries its *final* numbers) and `ticks`
-(aggregated locally into per-second bars).
+Two hosts are supported **for the Massive source**: `socket.massive.com` (real-time,
+the default) and `delayed.massive.com` (15-minute delayed). Two channels:
+`minute` (per-minute OHLCV windows, the default — bars lag ~1 minute because the
+window in flight is held until the next one starts, so it carries its *final*
+numbers) and `ticks` (aggregated locally into per-second bars). The Kraken
+source has one endpoint (`wss://ws.kraken.com/v2`), one channel (`minute`) and
+its bar length is `bar_interval_secs` — one of Kraken's own candle intervals
+(1m, 5m, 15m, 30m, 1h, 1d).
 
 Add Telegram delivery of the daily summaries by setting **both** keys (with
 neither, summaries print to the console only; with exactly one, `live` fails
@@ -285,6 +297,7 @@ docker run --rm \
 | `src/replay.rs` | Replay runner + `ReplaySession` (the per-bar pipeline both paths share) + human-readable report (trace, trades, day/session roll-ups) |
 | `src/accounting.rs` | Funded paper account for the report: fees, P/L, UTC-day bucketing |
 | `src/feed.rs` | Massive.com stocks WebSocket: framing, auth, subscribe, reconnect/backoff (transport only) |
+| `src/kraken.rs` | Kraken public market data: REST candles, Spot WebSocket v2 OHLC feed, pair resolution (transport only) |
 | `src/live.rs` | Live sessions: event → bar shaping, gap notes, session loop, daily summaries, CSV persistence |
 | `src/notify.rs` | Telegram delivery of daily summaries (`sendMessage` over rustls) |
 | `src/config.rs` | Layered configuration: env → config file → defaults |
@@ -309,7 +322,7 @@ while `docs/` covers behaviour, formats, and rules.
 |---|---|
 | [Overview](docs/overview.md) | Architecture pipeline, current scope (paper-only), module map |
 | [Replay Workflow](docs/replay-workflow.md) | Verifying settings against historic bars; guarantees; A/B loops |
-| [Live Market-Data Session](docs/live-market-data-session.md) | The `live` subcommand: Massive.com WebSocket, bar shaping, gap notes, mock-trade log, daily summaries, persisted CSV |
+| [Live Market-Data Session](docs/live-market-data-session.md) | The `live` subcommand: Massive.com and Kraken v2 WebSocket sources, `live_feed_source`, bar shaping, gap notes, mock-trade log, daily summaries, persisted CSV |
 | [Trading Engine](docs/engine.md) | The bar → signal → position loop and its retry invariant |
 | [Consecutive Closes Strategy](docs/strategy-consecutive-closes.md) | The only shipping strategy: rule, state machine, tuning |
 | [Market Data Model](docs/market-data-model.md) | `Bar` (validated OHLCV) and the `BarSeries` rolling window |
@@ -352,6 +365,7 @@ override the config file, which overrides compiled defaults**:
 | Paper trade fee (bps per side) | `PRICE_ACTION_TRADE_FEE_BPS` | `trade_fee_bps` | `5` |
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ |
+| Live feed source | `PRICE_ACTION_LIVE_FEED_SOURCE` | `live_feed_source` | `massive` |
 | Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` |
 | Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` |
 | Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ |
@@ -362,7 +376,8 @@ override the config file, which overrides compiled defaults**:
 
 Unknown config-file keys are rejected (typos fail fast). `live` **mode**
 (broker execution) requires `broker_url` and is not implemented; the `live`
-**subcommand** (market data) requires `massive_api_key` instead. An empty
+**subcommand** (market data) requires `massive_api_key` instead — but only when
+its source is Massive; the Kraken source is public and needs no key at all. An empty
 variable is treated as unset. Prefer the environment or a mounted secret for
 `broker_api_key`, `massive_api_key` and `telegram_bot_token` rather than
 committing them to a file — all three are redacted in any `Config` debug

@@ -45,6 +45,14 @@ trade_fee_bps = 5
 # These keys are read on every load path but only used by `live`.
 # ---------------------------------------------------------------------------
 
+# Which market data `live` streams from:
+#   "massive" — Massive.com stocks WebSocket (the default; authenticated,
+#               needs massive_api_key below)
+#   "kraken"  — Kraken Spot WebSocket v2 `ohlc` channel: PUBLIC, no key exists
+#               for it and none is read. Minute channel only; bars are Kraken's
+#               candles at bar_interval_secs (1m/5m/15m/30m/1h/1d).
+live_feed_source = "massive"
+
 # Massive.com socket host: a BARE hostname (no scheme, path or whitespace).
 # `live` builds wss://<host>/stocks from it.
 #   socket.massive.com   real-time
@@ -60,7 +68,8 @@ live_feed_channel = "minute"
 
 # Massive.com API key. SECRET — strongly prefer the
 # PRICE_ACTION_MASSIVE_API_KEY environment variable or a mounted secret over
-# committing it here. Required by `live`; never needed for replay.
+# committing it here. Required by `live` only when live_feed_source = "massive";
+# never needed for replay, and never read for the public Kraken source.
 # massive_api_key = "..."
 
 # Directory where `live` writes each session's bars as a replay-compatible CSV

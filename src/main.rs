@@ -10,14 +10,17 @@
 //!   pair from Kraken's public REST endpoint and runs them through the same
 //!   funded paper account as replay — real market history, fake money, no
 //!   orders; or
-//! - with `live`, streams real-time bars from the Massive.com WebSocket and
-//!   paper-trades them against a fake balance. **Execution is paper-only in
-//!   both modes: no order is ever sent to any venue.**
+//! - with `live`, streams real-time bars — from the Massive.com stocks
+//!   WebSocket (the default source, which takes an API key) or Kraken's
+//!   public Spot WebSocket v2 OHLC channel (`PRICE_ACTION_LIVE_FEED_SOURCE=
+//!   kraken`, no key: it is a public data endpoint) — and paper-trades them
+//!   against a fake balance. **Execution is paper-only in every mode: no
+//!   order is ever sent to any venue.**
 
 use std::env;
 
 use price_action::{
-    config::Config,
+    config::{Config, FeedSource},
     engine::Engine,
     error::Error,
     execution::PaperBroker,
@@ -207,11 +210,17 @@ fn parse_kraken_backtest_args(rest: &[String]) -> Result<(Option<String>, Option
     Ok((pair, interval_secs))
 }
 
-/// `live` streams real market data from the Massive.com WebSocket and
-/// paper-trades it: the same engine, strategy and funded paper account as
-/// replay, fed in real time instead of from a file. It requires a resolvable
-/// market-data API key (`PRICE_ACTION_MASSIVE_API_KEY`), and it **cannot place
-/// an order** — the feed is data-in only and the only broker is in-memory.
+/// `live` streams real market data and paper-trades it: the same engine,
+/// strategy and funded paper account as replay, fed in real time instead of
+/// from a file. The source is the `live_feed_source` setting — **Massive**
+/// (default; authenticated stocks WebSocket, needs
+/// `PRICE_ACTION_MASSIVE_API_KEY`) or **Kraken** (public Spot WebSocket v2
+/// OHLC channel: no key exists for it and none is read; bars are its candles
+/// at `bar_interval_secs`, which config validation has already constrained to
+/// one of Kraken's allowed intervals, minute mode only). Both sources feed the
+/// identical session loop — shaper, paper account, CSV persistence, the daily
+/// summaries below — and it **cannot place an order** either way: the feed is
+/// data-in only and the only broker is in-memory.
 ///
 /// Each closed UTC day is summarized to the console and, when a Telegram bot
 /// token and chat id are both configured, delivered there too; a failed
@@ -220,34 +229,77 @@ fn parse_kraken_backtest_args(rest: &[String]) -> Result<(Option<String>, Option
 /// Runs until Ctrl-C (or the feeder's channel closing), then prints the
 /// session report and says where the bars were persisted for re-replay.
 fn run_live() -> Result<(), Error> {
-    let config = Config::load_for_live()?;
+    let mut config = Config::load_for_live()?;
     // rustls needs a process-level crypto provider before the first TLS use;
     // without it the panic lands deep inside the library (see `feed`).
     feed::install_crypto_provider()?;
     // `None` when neither Telegram setting is present: console-only delivery.
     // A half-configured notifier is rejected here rather than silently ignored.
     let notifier = notify::TelegramNotifier::from_config(&config)?;
-    let api_key = config.massive_api_key.clone().ok_or_else(|| {
-        Error::Config(
-            "live market data needs an API key (set PRICE_ACTION_MASSIVE_API_KEY)".to_string(),
-        )
-    })?;
-    let settings = FeedSettings::for_stocks(
-        &config.live_feed_host,
-        api_key,
-        &config.symbol,
-        config.live_feed_channel,
-    );
-    settings.validate()?;
-
-    print_config_banner(&config);
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| Error::Execution(format!("cannot start the async runtime: {e}")))?;
+
+    // Source-specific preparation happens before the banner so everything that
+    // prints afterwards — banner, session log, CSV name — names the market
+    // actually being streamed. Massive validates its connection settings cheaply
+    // (no network yet). Kraken speaks public endpoints only: there is no key to
+    // read and nothing secret to keep, but the pair spelling still has to
+    // resolve now so both sides of that agree — the same pattern `kraken
+    // backtest` uses. `bar_interval_secs` doubles as that source's candle length.
+    let (massive_settings, kraken_settings) = match config.live_feed_source {
+        FeedSource::Massive => {
+            let api_key = config.massive_api_key.clone().ok_or_else(|| {
+                Error::Config(
+                    "live market data needs an API key (set PRICE_ACTION_MASSIVE_API_KEY)"
+                        .to_string(),
+                )
+            })?;
+            let settings = FeedSettings::for_stocks(
+                &config.live_feed_host,
+                api_key,
+                &config.symbol,
+                config.live_feed_channel,
+            );
+            settings.validate()?;
+            (Some(settings), None)
+        }
+        FeedSource::Kraken => {
+            let resolution = runtime.block_on(kraken::resolve_pair(&config.symbol))?;
+            let interval_secs: u32 = u32::try_from(config.bar_interval_secs).map_err(|_| {
+                // Cannot fail after `load_for_live`'s interval validation, so
+                // this is an internal invariant rather than user input.
+                Error::Config(
+                    "`bar_interval_secs` does not name a Kraken candle interval (internal)".into(),
+                )
+            })?;
+            let settings = kraken::KrakenSettings::new(resolution, interval_secs);
+            // Trade and report under the display form that was resolved.
+            config.symbol.clone_from(&settings.ws_symbol);
+            (None, Some(settings))
+        }
+    };
+
+    print_config_banner(&config);
+
     let output = runtime.block_on(async {
         let (tx, rx) = tokio::sync::mpsc::channel(live::EVENT_CHANNEL_SIZE);
         // The feeder owns reconnects; it stops when the session drops `rx`.
-        let _feeder = feed::spawn(settings.clone(), tx);
+        // Exactly one source was prepared above; the session label and the
+        // feeder task go together — Massive keeps its historic uppercased
+        // ticker, Kraken labels by the resolved display pair.
+        let (session_symbol, _feeder) = match (&massive_settings, &kraken_settings) {
+            (Some(settings), None) => {
+                (settings.symbol.clone(), feed::spawn(settings.clone(), tx))
+            }
+            (None, Some(settings)) => {
+                (settings.ws_symbol.clone(), kraken::spawn_v2(settings.clone(), tx))
+            }
+            // Neither or both prepared: a bug in the setup above, not input.
+            _ => return Err(Error::Execution(
+                "no exactly one live feed source was prepared".to_string(),
+            )),
+        };
 
         // Daily summaries are consumed on their own task so a slow or failing
         // consumer can never stall the session. The session owns the sender and
@@ -284,7 +336,7 @@ fn run_live() -> Result<(), Error> {
                 Err(e) => eprintln!("price-action: cannot watch for Ctrl-C ({e}); the session will only end when the feed channel closes"),
             }
         };
-        let result = live::run_session(&config, &settings, rx, shutdown, summary_tx).await;
+        let result = live::run_session(&config, &session_symbol, rx, shutdown, summary_tx).await;
         // Drain the reporter before the runtime is dropped, so the last day's
         // summary is printed rather than cancelled mid-flight.
         let _ = reporter.await;
