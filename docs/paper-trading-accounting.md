@@ -1,8 +1,8 @@
 ---
 type: Reference
 title: Paper Trading Accounting
-description: How the replay report — and the live session — price the strategy's decisions as a funded paper account: execution model, flat basis-point fees per side, insufficient-funds skipping, UTC-day bucketing and session roll-ups.
-tags: [replay, live, accounting, paper-trading, fees, p/l]
+description: How the replay report — and the live session — price the strategy's decisions as a funded paper account: execution model, flat basis-point fees per side, insufficient-funds skipping, configurable leverage with required-margin tracking and forced liquidation, UTC-day bucketing and session roll-ups.
+tags: [replay, live, accounting, paper-trading, fees, leverage, margin, p/l]
 status: draft
 sources:
   - id: accountingsrc
@@ -35,18 +35,20 @@ the bps rate, gross/net P/L, running cash/equity) and a
 
 All money is `f64` (validated finite upstream by configuration), shown at two
 decimals in the report; any field labelled *net* already includes fees. The
-model deliberately has **no leverage beyond** the configured `quantity`,
-**no slippage** beyond the flat fee rate, and **no persistence of the account
-itself** — a live session persists its *bars* (so the run is reproducible), but
-the account state is rebuilt by re-replaying them rather than stored.
+model deliberately has **no leverage beyond** the configured `quantity` unless
+`max_leverage` is raised (see the margin rules below), **no slippage** beyond
+the flat fee rate, and **no persistence of the account itself** — a live
+session persists its *bars* (so the run is reproducible), but the account state
+is rebuilt by re-replaying them rather than stored.
 
-## Two settings feed the account
+## Three settings feed the account
 
 | Setting (env / TOML) | Default | Meaning |
 |---|---|---|
 | `PRICE_ACTION_QUANTITY` / `quantity` | `1` | Units per position. Sizes every notional in the model — committed/collateralized funds, each leg's fee, cash/equity movements and P/L all scale with it, and affordability of an entry depends on it ([Configuration](configuration.md)). |
 | `PRICE_ACTION_STARTING_BALANCE` / `starting_balance` | `10000` | Free funds before the first trade; must be finite and strictly positive ([Configuration](configuration.md)). |
 | `PRICE_ACTION_TRADE_FEE_BPS` / `trade_fee_bps` | `5` | Fee per side of each paper trade, in **basis points** of that leg's notional: rate = `bps / 10_000`, so the default charges 0.05%. Zero disables fees exactly; negative values are rejected by config validation. |
+| `PRICE_ACTION_MAX_LEVERAGE` / `max_leverage` | `1` | Maximum leverage the paper account may put on a position: `1` = unleveraged, the documented default. Integer `1..100`; anything else is rejected naming `max_leverage`. Above 1 it multiplies the notional a position controls (and therefore its fees and P/L) **without** committing more capital — see the margin rules below ([Configuration](configuration.md)). |
 
 ## Execution model (the rules to re-check any trace line against)
 
@@ -85,8 +87,30 @@ the account state is rebuilt by re-replaying them rather than stored.
   paper account with no counterparty to owe. Closed-trade rows always keep
   the position's full arithmetic P/L (gross, fees, net) regardless of any
   write-off, so per-trade results stay auditable. There is **no margining,
-  liquidation cascade or stop-loss** on top of this floor: it *is* the whole
-  insolvency model.
+  liquidation cascade or stop-loss** on top of this floor at 1x: it *is* the
+  whole insolvency model; the leveraged forced-liquidation test below is the
+  only addition, and it never applies to an unleveraged run.
+- **Leverage (`max_leverage` > 1):** a position controls `quantity × leverage`
+  units of the instrument, so its **exposure** — the notional fees and P/L are
+  priced on — is `quantity × leverage × close`, while the capital it actually
+  commits is the **required margin** `quantity × close`. Leverage buys exposure
+  per unit of capital, it does not buy more capital, which is why sizing up is
+  what leverage is for in reality. Both legs' fees price the leveraged notional
+  and gross P/L scales by `leverage`:
+  - long: `gross = (exit − entry) × quantity × leverage`
+  - short: `gross = (entry − exit) × quantity × leverage`
+  An entry is still skipped when `required margin + entry fee > free funds`,
+  so a run can be fundable at 1x and skipped at 5x on the same bar.
+- **Forced liquidation (leveraged runs only):** before any strategy decision
+  for a bar, the account marks the open position at that bar's close; when
+  marked equity can no longer support the position's required margin, a real
+  venue would force-close it, so the simulation closes the position **at that
+  bar's close** and records the trade as `liquidated` (the trace line carries a
+  `[liquidated]` marker). The maintenance margin used is the position's
+  required margin — an approximation, since Kraken's real rule is tiered and
+  demands more than the initial margin; this is deliberately the simplest
+  breach test. Unleveraged (`1x`) runs never liquidate, and their report output
+  stays byte-identical to the historical shape.
 
 ## Roll-ups in the report
 
@@ -94,7 +118,11 @@ The account accumulates exactly what the report prints (see the full output
 shape in [Replay Workflow](replay-workflow.md)):[^accountingsrc]
 
 - **Closed paper trades** — one row per trade in *exit* order, with entry/exit
-  bar context (UTC day + price), investment, gross P/L, fees and net P/L.
+  bar context (UTC day + price), investment, gross P/L, fees and net P/L. A
+  leveraged run (`max_leverage` > 1) adds three columns — `required margin`,
+  `exposure` and `liquidated` — so a 1x and a leveraged report over identical
+  bars are visibly different; an unleveraged run prints the historical table
+  shape exactly.
 - **Totals per UTC day (24h)** — ISO `YYYY-MM-DD` calendar days; a day appears
   when it saw at least one entry *or* exit, and its net column only includes
   trades that **exited** that day (a trade open across midnight books to both
@@ -107,15 +135,21 @@ shape in [Replay Workflow](replay-workflow.md)):[^accountingsrc]
 - **Session totals** — starting balance, final free funds, final equity
   (marked at the last close), realized P/L over closed trades in exit order,
   and total fees on **every leg booked so far — including the entry leg of a
-  position still open when the session ends.**
+  position still open when the session ends.** A leveraged run additionally
+  reports `forced liquidations` and `peak required margin`, and the report
+  header carries a `leverage=Nx` line spelling out what the numbers price.
 
 ## What this model is *not*
 
 This is a teaching-grade cost model for reviewing settings, not a broker
 simulation: fills are always at the bar close (no intrabar slippage or
-partial fills), position sizing is the fixed `quantity` only (no margining,
-pyramiding or stop-losses), fees ignore venue minimums/tiers, and no account
-state is written to disk. It also cannot represent a venue rejecting an order
+partial fills), position sizing is the fixed `quantity` scaled by the
+configured `max_leverage` (no pyramiding, trailing stops or stop-losses), fees
+ignore venue minimums/tiers, and no account state is written to disk. The one
+margining rule that *does* exist is the forced-liquidation test above, whose
+maintenance margin is the position's required margin — Kraken's real rule is
+tiered and stricter, so read a leveraged run as an **optimistic bound on
+survival**, not a venue simulation. It also cannot represent a venue rejecting an order
 for any reason other than lack of account funds — which neither path has any
 reason to model, because neither can reach a venue.
 
@@ -127,6 +161,6 @@ a live session's totals are only as good as the data that arrived — read the
 
 [^accountingsrc]: `src/accounting.rs`: state machine in `PaperAccount::on_bar`, `exit_position`, equity mark, day arithmetic, and the test module with hand-computed reference values (long/short round trips, reversal, zero-fee exactness, insufficient-funds path, known UTC dates)
 
-[^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0) and `trade_fee_bps` (unsigned bps) in all three precedence layers with error-naming tests
+[^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0), `trade_fee_bps` (unsigned bps) and `max_leverage` (integer `1..100`) in all three precedence layers with error-naming tests
 
 [^liversrc]: `src/live.rs`: `SessionState::new` (constructs the same `ReplaySession`/`PaperAccount`), `log_mock_trade`, `DayAccumulator::record` (entries counted as funded position openings, matching `per_day_totals`), and the reconciliation test asserting a live day's summary equals the report's per-UTC-day roll-up

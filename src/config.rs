@@ -120,6 +120,13 @@ pub struct Config {
     /// Fee charged in basis points on each side's trade notional at entry and
     /// exit during replay accounting (5 = 0.05%).
     pub trade_fee_bps: u32,
+    /// Maximum leverage the paper account applies to a position: fees and P/L
+    /// price `quantity * max_leverage * price` while the capital committed
+    /// stays the **required margin** (`quantity * price`); a leveraged position
+    /// the account can no longer maintain is force-liquidated at a bar close
+    /// (see the margin policy in `accounting`). 1 = unleveraged, the documented
+    /// default; Kraken's own venue cap is 5x, this simulator allows up to 100.
+    pub max_leverage: u32,
     /// Broker/venue API base URL. Required in live mode.
     pub broker_url: Option<String>,
     /// Broker API key. Prefer the environment variable or a mounted secret
@@ -190,6 +197,7 @@ impl Default for Config {
             consecutive_closes_threshold: 3,
             starting_balance: 10_000.0,
             trade_fee_bps: 5,
+            max_leverage: 1,
             broker_url: None,
             broker_api_key: None,
             live_feed_host: "socket.massive.com".to_string(),
@@ -216,6 +224,7 @@ struct FileConfig {
     consecutive_closes_threshold: Option<u32>,
     starting_balance: Option<f64>,
     trade_fee_bps: Option<u32>,
+    max_leverage: Option<u32>,
     broker_url: Option<String>,
     broker_api_key: Option<String>,
     live_feed_host: Option<String>,
@@ -355,6 +364,9 @@ impl Config {
         if let Some(v) = file.trade_fee_bps {
             self.trade_fee_bps = v;
         }
+        if let Some(v) = file.max_leverage {
+            self.max_leverage = v;
+        }
         if let Some(v) = file.broker_url {
             self.broker_url = Some(v);
         }
@@ -399,6 +411,7 @@ impl Config {
         )?;
         env_override(env, "STARTING_BALANCE", &mut self.starting_balance)?;
         env_override(env, "TRADE_FEE_BPS", &mut self.trade_fee_bps)?;
+        env_override(env, "MAX_LEVERAGE", &mut self.max_leverage)?;
 
         if let Some(raw) = env("PRICE_ACTION_MODE") {
             self.mode = Mode::parse(&raw)
@@ -470,6 +483,16 @@ impl Config {
             return Err(ConfigError::invalid(
                 "starting_balance",
                 "must be a finite value greater than 0".into(),
+            ));
+        }
+        // Leverage is a whole-number multiplier: 0 would mean "no position",
+        // which is not a leverage the venue offers, and an absurd value only
+        // inflates exposure without bound, so the range is pinned. Kraken's own
+        // venue cap is lower (5x) — see docs/paper-trading-accounting.md.
+        if self.max_leverage == 0 || self.max_leverage > 100 {
+            return Err(ConfigError::invalid(
+                "max_leverage",
+                "must be between 1 and 100 (1 = unleveraged)".into(),
             ));
         }
         // The feed host is a bare hostname (no scheme, path, whitespace, or
@@ -577,6 +600,7 @@ impl fmt::Debug for Config {
             )
             .field("starting_balance", &self.starting_balance)
             .field("trade_fee_bps", &self.trade_fee_bps)
+            .field("max_leverage", &self.max_leverage)
             .field("broker_url", &self.broker_url)
             .field(
                 "broker_api_key",
@@ -785,23 +809,37 @@ bar_interval_secs = 300
         let cfg = Config::default();
         assert!((cfg.starting_balance - 10_000.0).abs() < f64::EPSILON * 32.0);
         assert_eq!(cfg.trade_fee_bps, 5);
+        assert_eq!(cfg.max_leverage, 1); // unleveraged: the documented model
     }
 
     #[test]
     fn accounting_settings_file_and_env_precedence() {
-        let path = write_temp_config("starting_balance = 25_000\ntrade_fee_bps = 10\n");
+        let path =
+            write_temp_config("starting_balance = 25_000\ntrade_fee_bps = 10\nmax_leverage = 3\n");
         let env = env_from(BTreeMap::from([
             ("PRICE_ACTION_STARTING_BALANCE", "500"),
             ("PRICE_ACTION_TRADE_FEE_BPS", "2"),
+            ("PRICE_ACTION_MAX_LEVERAGE", "5"),
         ]));
         let cfg = Config::load_from(&path, &env).unwrap();
         assert!((cfg.starting_balance - 500.0).abs() < f64::EPSILON * 32.0); // env beats file
         assert_eq!(cfg.trade_fee_bps, 2); // env beats file
+        assert_eq!(cfg.max_leverage, 5); // env beats file
 
         let cfg = Config::load_from(&path, &env_from(BTreeMap::new())).unwrap();
         assert!((cfg.starting_balance - 25_000.0).abs() < f64::EPSILON * 32.0); // file beats default
         assert_eq!(cfg.trade_fee_bps, 10);
+        assert_eq!(cfg.max_leverage, 3); // file beats default
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn max_leverage_outside_its_range_is_rejected() {
+        for raw in ["0", "101"] {
+            let env = env_from(BTreeMap::from([("PRICE_ACTION_MAX_LEVERAGE", raw)]));
+            let err = Config::load_from(&no_file(), &env).unwrap_err();
+            assert!(err.to_string().contains("max_leverage"), "for {raw}: {err}");
+        }
     }
 
     #[test]

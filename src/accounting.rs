@@ -16,7 +16,23 @@
 //! an insolvent position contributes zero to account value rather than
 //! negative debt. Free funds are never reported negative, and trade rows keep
 //! reporting the full arithmetic P/L of each position regardless of any
-//! write-off. There is no margining on top of this: the floor *is* the model
+//! write-off.
+//!
+//! Margin/leverage policy (defined, not silent): `max_leverage` (config) is
+//! the leverage the paper account applies to every position — **1x is exactly
+//! the unleveraged model above**, byte-for-byte. At leverage `L` the account
+//! controls `L` times the notional per unit of committed capital, so **fees
+//! and P/L price the leveraged notional** (`quantity * L * price`) while the
+//! capital committed stays the **required margin** (`quantity * price`).
+//! While a *leveraged* position (`L > 1`) is open the venue requires the
+//! account to keep that margin: when marked equity at a bar close falls below
+//! the required margin, the position is **force-liquidated at that close**
+//! (exit fee on the leveraged notional, the trade flagged liquidated, the bar
+//! effectively flat afterwards). At 1x there is no maintenance requirement
+//! beyond the entry commitment — the insolvency floor above is the whole
+//! model, so unleveraged runs stay exactly as documented. Kraken's real
+//! leverage tiers and maintenance-margin rules are venue-specific; this is a
+//! documented approximation, not a venue quote.
 //!
 //! Arithmetic note: every value here is a finite, display-grade money or date
 //! quantity whose operands are validated upstream (config and `Bar`), so the
@@ -57,6 +73,17 @@ pub struct ClosedTrade {
     pub gross_pl: f64,
     /// Realized P/L net of `fees_paid`; this is what rolls up into totals.
     pub net_pl: f64,
+    /// Capital the venue requires to hold the position (`quantity * entry_price`
+    /// = `investment`; `exposure / leverage`). The maintenance-margin test
+    /// compares marked equity to this while a leveraged position is open.
+    pub required_margin: f64,
+    /// `quantity * leverage * entry_price`: the notional the position controls
+    /// at entry — fees and P/L price this, so it is `investment * leverage`
+    /// (equals `investment` at 1x).
+    pub exposure: f64,
+    /// True when the venue force-closed (liquidated) the position at a bar
+    /// close because marked equity fell below `required_margin`.
+    pub liquidated: bool,
 }
 
 /// Realized activity for one UTC calendar day (only days that saw an entry or
@@ -87,6 +114,11 @@ pub struct SessionTotals {
     pub total_fees_paid: f64,
     /// Sum of net P/L over all closed trades.
     pub total_net_pl: f64,
+    /// Positions the venue force-closed (liquidated) during the session.
+    pub liquidations: usize,
+    /// Largest required margin held open at any point in the session (equals
+    /// the largest committed notional at 1x leverage).
+    pub peak_required_margin: f64,
 }
 
 /// Account funds right after a bar is priced.
@@ -109,6 +141,9 @@ pub struct BarOutcome {
     /// True if this bar's desired entry was skipped for lack of funds — render
     /// as an `(insufficient funds)` note on the trace line.
     pub entry_skipped: bool,
+    /// True if this bar's close forced a liquidation of the open position
+    /// (maintenance margin breached) — render as a `[liquidated]` note.
+    pub liquidated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -125,11 +160,23 @@ pub struct PaperAccount {
     starting_balance: f64,
     /// Fee rate as a fraction (bps / `10_000`); zero bps disables fees.
     fee_rate: f64,
+    /// Leverage multiplier applied to every position (1 = unleveraged). Fees
+    /// and P/L price `quantity * leverage * price`; committed capital stays
+    /// the required margin `quantity * price`.
+    leverage: f64,
     available: f64,
     open_side: Option<Side>,
     entry_price: f64,
     entry_notional: f64,
     entry_fee: f64,
+    /// Capital the venue requires for the open position (`quantity * entry
+    /// price`); zero while flat. Maintenance-margin liquidation compares
+    /// marked equity to this.
+    required_margin: f64,
+    /// Largest required margin ever held open (session peak).
+    peak_required_margin: f64,
+    /// Positions the venue force-closed at a bar close (liquidations).
+    liquidations: usize,
     entry_bar_index: usize,
     entry_ts_secs: i64,
     entry_day: String,
@@ -148,16 +195,27 @@ impl PaperAccount {
     /// Creates the account. Reaching this constructor is gated by config
     /// validation (`starting_balance > 0` and finite), so no re-checks here.
     #[must_use]
-    pub fn new(quantity: u32, starting_balance: f64, trade_fee_bps: u32) -> Self {
+    pub fn new(
+        quantity: u32,
+        starting_balance: f64,
+        trade_fee_bps: u32,
+        max_leverage: u32,
+    ) -> Self {
         Self {
             quantity: f64::from(quantity),
             starting_balance,
             fee_rate: f64::from(trade_fee_bps) / 10_000.0,
+            // Config validation gates `max_leverage >= 1`; the clamp is
+            // defensive so a hand-built account can never divide by zero.
+            leverage: f64::from(max_leverage.max(1)),
             available: starting_balance,
             open_side: None,
             entry_price: 0.0,
             entry_notional: 0.0,
             entry_fee: 0.0,
+            required_margin: 0.0,
+            peak_required_margin: 0.0,
+            liquidations: 0,
             entry_bar_index: 0,
             entry_ts_secs: 0,
             entry_day: String::new(),
@@ -205,17 +263,25 @@ impl PaperAccount {
     /// - Exit: if the position held no longer matches the new signal (flat
     ///   target or a reversal), it exits **first** at this same close —
     ///   committed capital returns, signed P/L is credited, and an exit fee on
-    ///   this bar's notional is charged.
+    ///   this bar's **leveraged** notional is charged.
     /// - Entry: then, if flat and the signal wants long/short, entering costs
     ///   `quantity * close` plus its entry fee. When that exceeds available
     ///   funds the entry is **skipped** (the bar effectively stays flat; after
     ///   a reversal the old leg's exit stands and no new position opens) — the
-    ///   account never reports negative funds.
+    ///   account never reports negative funds. Affordability compares the
+    ///   **required margin** plus the fee on the leveraged notional: leverage
+    ///   buys exposure, not capital.
     /// - The outcome carries post-bar funds/equity (any still-open position is
     ///   marked at this close), the effective signal, and a skip flag for trace
     ///   notes. This account tracks its own held position, so transitions
     ///   (hold / exit / enter / reverse) are derived from it — `next` only has
     ///   to be the strategy's raw per-bar signal.
+    /// - Liquidation: after the bar's decisions, a still-open **leveraged**
+    ///   position (`leverage > 1`) whose marked equity at this close has fallen
+    ///   below its required margin is force-closed at this same close. A fresh
+    ///   entry can never liquidate on its own bar (its mark equals the margin
+    ///   it just committed), and an unleveraged (1x) account is never
+    ///   force-closed — the insolvency floor is its whole policy.
     #[allow(clippy::arithmetic_side_effects)] // bounded money math
     pub fn on_bar(&mut self, next: &Signal, bar_index: usize, bar: &Bar) -> BarOutcome {
         let close = bar.close();
@@ -223,28 +289,42 @@ impl PaperAccount {
 
         // Exit first (a reversal exits the old leg at this same close).
         if self.is_open() && self.held_signal() != *next {
-            self.exit_position(bar_index, ts_secs, close);
+            self.exit_position(bar_index, ts_secs, close, false);
         }
 
         let mut entry_skipped = false;
         if !self.is_open() && next != &Signal::Flat {
-            let notional = self.quantity * close;
-            let fee = notional * self.fee_rate;
-            if notional + fee > self.available {
+            // Capital committed is the required margin; the fee prices the
+            // leveraged notional the position will control.
+            let margin = self.quantity * close;
+            let fee = margin * self.leverage * self.fee_rate;
+            if margin + fee > self.available {
                 entry_skipped = true;
             } else {
-                self.apply_costs(notional, fee);
+                self.apply_costs(margin, fee);
                 self.open_side = Some(match next {
                     Signal::Long => Side::Long,
                     _ => Side::Short,
                 });
                 self.entry_price = close;
-                self.entry_notional = notional;
+                self.entry_notional = margin;
                 self.entry_fee = fee;
+                self.required_margin = margin;
+                self.peak_required_margin = self.peak_required_margin.max(margin);
                 self.entry_bar_index = bar_index;
                 self.entry_ts_secs = ts_secs;
                 self.entry_day = utc_day(ts_secs);
             }
+        }
+
+        // Maintenance-margin liquidation (leveraged positions only): the venue
+        // force-closes at this bar's close when marked equity can no longer
+        // support the position's required margin.
+        let liquidated =
+            self.leverage > 1.0 && self.is_open() && self.mark_equity(close) < self.required_margin;
+        if liquidated {
+            self.liquidations = self.liquidations.saturating_add(1);
+            self.exit_position(bar_index, ts_secs, close, true);
         }
 
         BarOutcome {
@@ -254,6 +334,7 @@ impl PaperAccount {
             },
             effective_signal: self.held_signal(),
             entry_skipped,
+            liquidated,
         }
     }
 
@@ -270,13 +351,15 @@ impl PaperAccount {
     pub fn mark_equity(&self, price: f64) -> f64 {
         let value = match self.open_side {
             Some(Side::Long) => {
-                let long_mark = self.quantity * price; // free funds + shares at price
-                self.available + long_mark
+                // Required margin plus the leveraged swing since entry; at
+                // 1x this is exactly `available + quantity * price`.
+                let unrealized = (price - self.entry_price) * self.quantity * self.leverage;
+                self.available + self.required_margin + unrealized
             }
             Some(Side::Short) => {
-                let short_pl = (self.entry_price - price) * self.quantity;
+                let short_pl = (self.entry_price - price) * self.quantity * self.leverage;
                 // Collateral stays reserved while the lock lasts:
-                self.available + self.entry_notional + short_pl
+                self.available + self.required_margin + short_pl
             }
             None => self.available,
         };
@@ -356,6 +439,8 @@ impl PaperAccount {
             final_equity: final_close.map_or(self.available, |p| self.mark_equity(p)),
             total_fees_paid: self.total_fees_paid,
             total_net_pl: self.canonical_net_running,
+            liquidations: self.liquidations,
+            peak_required_margin: self.peak_required_margin,
         }
     }
 
@@ -372,7 +457,7 @@ impl PaperAccount {
     /// realized loss plus fees exceed what closing frees, free funds floor at
     /// **zero**; the shortfall is written off in the same bar's mark, which
     /// reduces equity without ever reporting negative `available` afterwards.
-    fn exit_position(&mut self, bar_index: usize, ts_secs: i64, close: f64) {
+    fn exit_position(&mut self, bar_index: usize, ts_secs: i64, close: f64, liquidated: bool) {
         if !self.is_open() {
             return; // defensive: idempotent under repeated calls
         }
@@ -381,10 +466,12 @@ impl PaperAccount {
         let committed = self.entry_notional;
         let entry_fee = self.entry_fee;
 
-        let exit_fee = (self.quantity * close) * self.fee_rate;
+        // Fees and P/L price the leveraged notional; at 1x this is the plain
+        // per-side notional fee and single-unit P/L.
+        let exit_fee = (self.quantity * close * self.leverage) * self.fee_rate;
         let gross_pl = match side {
-            Side::Long => (close - entry_price) * self.quantity,
-            Side::Short => (entry_price - close) * self.quantity,
+            Side::Long => (close - entry_price) * self.quantity * self.leverage,
+            Side::Short => (entry_price - close) * self.quantity * self.leverage,
         };
 
         // Release capital, credit P/L, charge the exit fee — clamped so free
@@ -415,9 +502,13 @@ impl PaperAccount {
             fees_paid,
             gross_pl,
             net_pl,
+            required_margin: self.required_margin,
+            exposure: committed * self.leverage,
+            liquidated,
         });
 
         self.open_side = None;
+        self.required_margin = 0.0;
     }
 }
 
@@ -489,7 +580,7 @@ mod tests {
 
     #[test]
     fn long_round_trip_net_of_fees() {
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         near(acc.available(), 10_000.0);
 
         let out = acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
@@ -518,7 +609,7 @@ mod tests {
 
     #[test]
     fn short_round_trip_net_of_fees() {
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         let out = acc.on_bar(&S::Short, 0, &bar(10.0, D_BASE));
         assert!(!out.entry_skipped);
         near(out.state.available, 9_989.995); // collateral locked at notional
@@ -537,7 +628,7 @@ mod tests {
 
     #[test]
     fn zero_fee_round_trips_are_exact() {
-        let mut acc = PaperAccount::new(2, 5_000.0, 0); // quantity 2 to mix in units
+        let mut acc = PaperAccount::new(2, 5_000.0, 0, 1); // quantity 2 to mix in units
         let out = acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
         near(out.state.available, 4_980.0); // - 2*10 notional
         near(out.state.equity, 5_000.0); // 4980 free + 2 shares at 10
@@ -549,7 +640,7 @@ mod tests {
 
     #[test]
     fn reversal_exits_then_enters_at_same_close() {
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
 
         // Long -> Short at 12.5: exit long leg, then enter short same close.
@@ -571,7 +662,7 @@ mod tests {
 
     #[test]
     fn insufficient_entry_is_skipped_and_recoverable() {
-        let mut acc = PaperAccount::new(1, 10.0, 5);
+        let mut acc = PaperAccount::new(1, 10.0, 5, 1);
         let out = acc.on_bar(&S::Long, 0, &bar(30.0, D_BASE));
         assert!(out.entry_skipped); // needs 30 + fee > 10
         assert_eq!(out.effective_signal, S::Flat);
@@ -586,7 +677,7 @@ mod tests {
 
     #[test]
     fn per_day_totals_split_by_utc_exit_and_entry_days() {
-        let mut acc = PaperAccount::new(1, 10_000.0, 0);
+        let mut acc = PaperAccount::new(1, 10_000.0, 0, 1);
         // Cross the UTC midnight between two bars (16h apart).
         let t_next_day = D_BASE + 57_600; // 2024-09-05 (UTC)
         acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
@@ -606,7 +697,7 @@ mod tests {
 
     #[test]
     fn session_totals_sum_closed_trades() {
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
         acc.on_bar(&S::Flat, 1, &bar(12.0, D_BASE + 900));
 
@@ -623,7 +714,7 @@ mod tests {
         // With every close on one calendar day, the session row and the day
         // row sum in the same (close-order) sequence — they must coincide to
         // the bit, which is what makes the report self-consistent.
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
         acc.on_bar(&S::Short, 1, &bar(12.0, D_BASE + 900)); // exit long + open short
         acc.on_bar(&S::Flat, 2, &bar(13.5, D_BASE + 1_800)); // close same day
@@ -640,7 +731,7 @@ mod tests {
         // Entry on 2024-09-04, no exit: the day table must still show the
         // entry (and the session fees must include that leg), per the
         // roll-up contract.
-        let mut acc = PaperAccount::new(1, 10_000.0, 5);
+        let mut acc = PaperAccount::new(1, 10_000.0, 5, 1);
         let out = acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
         assert!(!out.entry_skipped);
 
@@ -664,7 +755,7 @@ mod tests {
         // Free funds stay ≥ the entry cost by construction (10.01 covers
         // notional 10 + fee 0.005); the exit then loses far more than the
         // account holds: 10 - 25 = -15 against 0.005 of free funds.
-        let mut acc = PaperAccount::new(1, 10.01, 5);
+        let mut acc = PaperAccount::new(1, 10.01, 5, 1);
         let out = acc.on_bar(&S::Short, 0, &bar(10.0, D_BASE));
         assert!(!out.entry_skipped);
         near(out.state.available, 0.005);
@@ -691,6 +782,100 @@ mod tests {
         near(totals.final_equity, 0.0); // floored, not negative debt
         near(totals.total_net_pl, -15.0175); // arithmetic loss still reported
         near(totals.total_fees_paid, 0.0175);
+    }
+
+    #[test]
+    fn leveraged_run_scales_fees_and_pl_on_identical_bars() {
+        // Same fixture price path at 1x and 5x: fees and P/L price the
+        // leveraged notional, so the leveraged run is exactly 5x the flat one
+        // while committed capital (required margin) stays identical.
+        let mut flat = PaperAccount::new(1, 10_000.0, 5, 1);
+        let mut levered = PaperAccount::new(1, 10_000.0, 5, 5);
+        flat.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+        levered.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+        flat.on_bar(&S::Flat, 1, &bar(12.0, D_BASE + 900));
+        levered.on_bar(&S::Flat, 1, &bar(12.0, D_BASE + 900));
+
+        let a = &flat.closed_trades()[0];
+        let b = &levered.closed_trades()[0];
+        near(a.investment, 10.0);
+        near(b.investment, 10.0); // committed capital (required margin) unchanged
+        near(b.required_margin, 10.0);
+        near(b.exposure, 50.0); // quantity * leverage * entry close
+        near(a.fees_paid, 0.011);
+        near(b.fees_paid, 0.055); // 5x the flat run's fees
+        near(a.gross_pl, 2.0);
+        near(b.gross_pl, 10.0); // 5x the flat run's P/L
+        near(b.net_pl, 9.945);
+        near(levered.session_totals(Some(12.0)).total_fees_paid, 0.055);
+        assert_eq!(levered.session_totals(Some(12.0)).liquidations, 0);
+    }
+
+    #[test]
+    fn fixture_price_path_forces_liquidation_when_margin_breached() {
+        // Fixture price path (10 -> 9 on a full-margin account): the 1x run
+        // holds the position, the 5x run breaches its maintenance margin and
+        // the venue force-closes at that same bar close.
+        let mut flat = PaperAccount::new(100, 1_000.0, 0, 1);
+        let mut levered = PaperAccount::new(100, 1_000.0, 0, 5);
+        flat.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+        levered.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+
+        let out_flat = flat.on_bar(&S::Long, 1, &bar(9.0, D_BASE + 900));
+        assert_eq!(out_flat.effective_signal, S::Long); // still open at 1x
+        assert!(!out_flat.liquidated);
+        near(out_flat.state.equity, 900.0);
+        assert!(flat.closed_trades().is_empty());
+
+        let out = levered.on_bar(&S::Long, 1, &bar(9.0, D_BASE + 900));
+        assert!(out.liquidated);
+        assert_eq!(out.effective_signal, S::Flat); // force-closed at this close
+        near(out.state.equity, 500.0);
+        near(out.state.available, 500.0);
+        let t = &levered.closed_trades()[0];
+        assert!(t.liquidated);
+        near(t.required_margin, 1_000.0);
+        near(t.exposure, 5_000.0); // 100 units * 5x at the entry close
+        near(t.gross_pl, -500.0); // (9 - 10) * 100 * 5
+        near(t.net_pl, -500.0); // zero bps
+        assert_eq!(levered.session_totals(Some(9.0)).liquidations, 1);
+        near(
+            levered.session_totals(Some(9.0)).peak_required_margin,
+            1_000.0,
+        );
+    }
+
+    #[test]
+    fn liquidation_insolvency_edge_floors_free_funds_not_the_trade() {
+        // The gap is so deep that marked equity is already floored at zero:
+        // liquidation still books the full arithmetic loss, and free funds
+        // floor at zero rather than reporting negative debt.
+        let mut acc = PaperAccount::new(100, 1_000.0, 0, 5);
+        acc.on_bar(&S::Long, 0, &bar(10.0, D_BASE));
+        let out = acc.on_bar(&S::Long, 1, &bar(0.5, D_BASE + 900));
+        assert!(out.liquidated);
+        near(out.state.equity, 0.0); // floored, not -3_750
+        near(out.state.available, 0.0);
+        let t = &acc.closed_trades()[0];
+        near(t.gross_pl, -4_750.0); // (0.5 - 10) * 100 * 5
+        near(t.net_pl, -4_750.0);
+        assert_eq!(acc.session_totals(Some(0.5)).liquidations, 1);
+    }
+
+    #[test]
+    fn leveraged_entry_fee_gates_affordability() {
+        // The fee prices the leveraged notional, so a run can be fundable at
+        // 1x and skipped at 5x on the same bar (margin + fee > free funds).
+        let mut flat = PaperAccount::new(1, 10.0, 500, 1); // 5% per side
+        let mut levered = PaperAccount::new(1, 10.0, 500, 5);
+        let out_flat = flat.on_bar(&S::Long, 0, &bar(9.0, D_BASE));
+        // margin 9 + fee 9*0.05 = 0.45 -> 9.45 <= 10: enters
+        assert!(!out_flat.entry_skipped);
+        let out = levered.on_bar(&S::Long, 0, &bar(9.0, D_BASE));
+        // margin 9 + fee 45*0.05 = 2.25 -> 11.25 > 10: skipped
+        assert!(out.entry_skipped);
+        assert_eq!(out.effective_signal, S::Flat);
+        near(out.state.available, 10.0);
     }
 
     #[test]

@@ -33,6 +33,15 @@ starting_balance = 10000
 # (>= 0; 5 = 0.05% of each leg's notional; 0 disables fees).
 trade_fee_bps = 5
 
+# Maximum leverage a paper position may carry (>= 1, <= 100; 1 = unleveraged).
+# Above 1 the position controls quantity*leverage units of notional: fees and
+# P/L price that leveraged notional, while the capital committed stays the
+# required margin (quantity*close). A position whose required margin marked
+# equity can no longer support is force-closed ("liquidated") at that bar's
+# close. Leveraged runs print extra report columns and totals rows; 1x output
+# is unchanged. See docs/paper-trading-accounting.md.
+max_leverage = 1
+
 # Broker/venue API base URL — required in live mode.
 # broker_url = "https://broker.example/api"
 

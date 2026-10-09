@@ -363,6 +363,7 @@ override the config file, which overrides compiled defaults**:
 | Strategy threshold | `PRICE_ACTION_CONSECUTIVE_CLOSES_THRESHOLD` | `consecutive_closes_threshold` | `3` |
 | Paper starting balance | `PRICE_ACTION_STARTING_BALANCE` | `starting_balance` | `10000` |
 | Paper trade fee (bps per side) | `PRICE_ACTION_TRADE_FEE_BPS` | `trade_fee_bps` | `5` |
+| Max leverage | `PRICE_ACTION_MAX_LEVERAGE` | `max_leverage` | `1` |
 | Broker API base URL | `PRICE_ACTION_BROKER_URL` | `broker_url` | _(unset)_ |
 | Broker API key | `PRICE_ACTION_BROKER_API_KEY` | `broker_api_key` | _(unset)_ |
 | Live feed source | `PRICE_ACTION_LIVE_FEED_SOURCE` | `live_feed_source` | `massive` |

@@ -81,12 +81,19 @@ pub struct ReplaySession {
 impl ReplaySession {
     /// Creates an empty session trading `quantity` units from
     /// `starting_balance`, charging `trade_fee_bps` per side on each notional,
-    /// with the example strategy firing at `threshold` consecutive closes.
+    /// with the example strategy firing at `threshold` consecutive closes, leveraged
+    /// `max_leverage` times (1 = unleveraged, the documented default model).
     #[must_use]
-    pub fn new(quantity: u32, starting_balance: f64, trade_fee_bps: u32, threshold: u32) -> Self {
+    pub fn new(
+        quantity: u32,
+        starting_balance: f64,
+        trade_fee_bps: u32,
+        max_leverage: u32,
+        threshold: u32,
+    ) -> Self {
         Self {
             engine: Engine::new(ConsecutiveCloses::new(threshold), PaperBroker::new()),
-            account: PaperAccount::new(quantity, starting_balance, trade_fee_bps),
+            account: PaperAccount::new(quantity, starting_balance, trade_fee_bps, max_leverage),
             trace_lines: Vec::new(),
             entries: 0,
             skipped_entries: 0,
@@ -147,6 +154,8 @@ impl ReplaySession {
                 signal_str(signal),
                 note = if outcome.entry_skipped {
                     "   (insufficient funds)"
+                } else if outcome.liquidated {
+                    "   [liquidated]"
                 } else if entry {
                     "   (entry)"
                 } else {
@@ -240,6 +249,7 @@ pub fn replay_bars(config: &Config, bars: &[Bar]) -> Result<ReplayReport, Error>
         config.quantity,
         config.starting_balance,
         config.trade_fee_bps,
+        config.max_leverage,
         config.consecutive_closes_threshold,
     );
     for bar in bars {
@@ -287,11 +297,26 @@ pub fn render_report(
     }
     writeln!(out, "{sep}")?;
 
-    print_closed_trades(out, report)?;
+    // A leveraged run says so on its own header line: the 1x header stays
+    // byte-identical to what README.md and docs/replay-workflow.md pin.
+    if config.max_leverage > 1 {
+        writeln!(
+            out,
+            "leverage={}x: fees and P/L price the leveraged notional; capital committed is the required margin",
+            config.max_leverage,
+        )?;
+    }
+    writeln!(out, "{sep}")?;
+    for line in &report.trace_lines {
+        writeln!(out, "{line}")?;
+    }
+    writeln!(out, "{sep}")?;
+
+    print_closed_trades(out, report, config.max_leverage)?;
     write_blank_line(out)?;
     print_per_day_totals(out, report)?;
     write_blank_line(out)?;
-    print_session_totals(out, report)?;
+    print_session_totals(out, report, config.max_leverage)?;
     write_blank_line(out)?;
 
     writeln!(
@@ -317,13 +342,23 @@ pub fn print_report(
 
 /// Closed-paper-trade table (money fields net of fees where labelled). No-
 /// trade runs print a single `none` line so the section is always present.
-fn print_closed_trades(out: &mut dyn std::io::Write, report: &ReplayReport) -> std::io::Result<()> {
+///
+/// `leverage` only decides whether the extra margin/exposure columns are
+/// printed: an unleveraged (1x) run keeps the historical table shape exactly,
+/// while a leveraged run shows the required margin and the notional the
+/// position actually controlled, so a 1x and a leveraged report over the same
+/// bars are visibly different.
+fn print_closed_trades(
+    out: &mut dyn std::io::Write,
+    report: &ReplayReport,
+    leverage: u32,
+) -> std::io::Result<()> {
     writeln!(out, "closed paper trades (net of fees):")?;
     if report.closed_trades.is_empty() {
         return writeln!(out, "  none");
     }
 
-    let mut rows: Vec<Vec<String>> = vec![vec![
+    let mut header: Vec<String> = vec![
         "#".to_string(),
         "side".to_string(),
         "entry day".to_string(),
@@ -334,9 +369,17 @@ fn print_closed_trades(out: &mut dyn std::io::Write, report: &ReplayReport) -> s
         "gross P/L".to_string(),
         "fees".to_string(),
         "net P/L".to_string(),
-    ]];
+    ];
+    if leverage > 1 {
+        header.extend([
+            "required margin".to_string(),
+            "exposure".to_string(),
+            "liquidated".to_string(),
+        ]);
+    }
+    let mut rows: Vec<Vec<String>> = vec![header];
     for t in &report.closed_trades {
-        rows.push(vec![
+        let mut row = vec![
             format!("{}.", t.index),
             if t.side_is_long { "long" } else { "short" }.to_string(),
             t.entry_day.clone(),
@@ -347,7 +390,15 @@ fn print_closed_trades(out: &mut dyn std::io::Write, report: &ReplayReport) -> s
             signed2(t.gross_pl),
             money2(t.fees_paid),
             signed2(t.net_pl),
-        ]);
+        ];
+        if leverage > 1 {
+            row.extend([
+                money2(t.required_margin),
+                money2(t.exposure),
+                if t.liquidated { "yes" } else { "-" }.to_string(),
+            ]);
+        }
+        rows.push(row);
     }
     write_table(out, &rows)
 }
@@ -381,13 +432,17 @@ fn print_per_day_totals(
 
 /// Whole session: funds at the end (a still-open open position keeps its
 /// capital/collateral out of `available`), realized P/L net of fees.
+/// `leverage` gates the margin rows: an unleveraged run prints the historical
+/// session-total shape exactly, a leveraged run adds the forced-liquidation
+/// count and the peak required margin so the two runs are comparable.
 fn print_session_totals(
     out: &mut dyn std::io::Write,
     report: &ReplayReport,
+    leverage: u32,
 ) -> std::io::Result<()> {
     writeln!(out, "session totals:")?;
     let s = &report.session_totals;
-    let rows = vec![
+    let mut rows = vec![
         vec!["starting balance".to_string(), money2(s.starting_balance)],
         vec![
             "final available funds".to_string(),
@@ -406,6 +461,16 @@ fn print_session_totals(
             money2(s.total_fees_paid),
         ],
     ];
+    if leverage > 1 {
+        rows.push(vec![
+            "forced liquidations".to_string(),
+            s.liquidations.to_string(),
+        ]);
+        rows.push(vec![
+            "peak required margin".to_string(),
+            money2(s.peak_required_margin),
+        ]);
+    }
     write_table(out, &rows)
 }
 
@@ -642,6 +707,7 @@ mod tests {
             config.quantity,
             config.starting_balance,
             config.trade_fee_bps,
+            config.max_leverage,
             config.consecutive_closes_threshold,
         );
         for b in &bars {
@@ -673,6 +739,7 @@ mod tests {
             config.quantity,
             config.starting_balance,
             config.trade_fee_bps,
+            config.max_leverage,
             config.consecutive_closes_threshold,
         );
 
