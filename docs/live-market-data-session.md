@@ -1,13 +1,16 @@
 ---
 type: Reference
 title: Live Market-Data Session
-description: The `live` subcommand — streaming real-time bars from the Massive.com WebSocket, paper-trading them against a funded fake balance, and reporting/persisting the result.
-tags: [live, market-data, websocket, paper-trading, massive]
+description: The `live` subcommand — streaming real-time bars (from the Massive.com stocks WebSocket or Kraken's public Spot WebSocket v2 OHLC channel), paper-trading them against a funded fake balance, and reporting/persisting the result.
+tags: [live, market-data, websocket, paper-trading, massive, kraken]
 status: draft
 sources:
   - id: feedrs
     resource: /src/feed.rs
     title: Feed module source (wire protocol, framing, reconnect/backoff, tests)
+  - id: krakenrs
+    resource: /src/kraken.rs
+    title: Kraken market-data source (REST candles, WS v2 OHLC feed, pair resolution, tests)
   - id: livers
     resource: /src/live.rs
     title: Live session source (bar shaping, session loop, summaries, persistence, tests)
@@ -26,9 +29,10 @@ generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T14:22:52Z }
 `price-action live` answers a different question from
 [replay](replay-workflow.md): not *"what would these settings have done on
 recorded history?"* but *"what is this strategy doing **right now**, against
-real market data, with fake money?"* It streams real-time bars from the
-Massive.com stocks WebSocket and runs them through **the same engine, strategy
-and funded paper account** offline replay uses.[^livers][^replayrs]
+real market data, with fake money?"* It streams real-time bars — from the
+Massive.com stocks WebSocket (the default source) or from Kraken's public Spot
+WebSocket v2 OHLC channel — and runs them through **the same engine, strategy
+and funded paper account** offline replay uses.[^livers][^replayrs][^krakenrs]
 
 ## The guarantee that matters most
 
@@ -55,10 +59,47 @@ PRICE_ACTION_MASSIVE_API_KEY=<your key> \
 
 `live` takes **no arguments** — everything is configuration
 ([Configuration](configuration.md)). It exits `1` with a usage error when given
-any, and exits `1` naming `massive_api_key` when no API key resolves, because
-the feed is authenticated. A session runs until **Ctrl-C** (or the event
-channel closing), then flushes, prints the report and names the persisted
-CSV.[^mainrs]
+any. When the source is Massive it exits `1` naming `massive_api_key` if no key
+resolves, because that feed is authenticated; a Kraken session reads no key at
+all and fails only on its own settings (see below). A session runs until
+**Ctrl-C** (or the event channel closing), then flushes, prints the report and
+names the persisted CSV.[^mainrs]
+
+## Choosing the market-data source
+
+`live_feed_source` (env `PRICE_ACTION_LIVE_FEED_SOURCE`, case-insensitive and
+trimmed) picks where the bars come from. It gates only `live`: replay and the
+no-args path never read it.[^config-src]
+
+| Source | Endpoint | Auth | Bar cadence |
+|---|---|---|---|
+| `massive` (default) | `wss://<live_feed_host>/stocks` | API key required (`PRICE_ACTION_MASSIVE_API_KEY`) | `AM` minute windows, or `T` ticks (`live_feed_channel`) |
+| `kraken` | `wss://ws.kraken.com/v2` `ohlc` channel | **none** — a public data endpoint; no key exists for it and none is read | Kraken's candles at `bar_interval_secs` |
+
+Selecting `kraken` changes the *transport and the bar cadence* and nothing else:
+the session loop, `BarShaper`'s hold-until-next-window rule, the paper account,
+the mock-trade log, the daily summaries and the persisted CSV are the same code
+either way. Two Kraken-specific rules are enforced by
+`Config::load_for_live()` (`validate_live_market_data`) before the session
+starts, so a mistake fails before any connection:
+
+- `live_feed_channel` must be `"minute"` — Kraken's v2 OHLC channel streams
+  candles, there is no tick channel here; `ticks` is rejected naming the setting.
+- `bar_interval_secs` must name one of Kraken's own candle intervals
+  (`60`, `300`, `900`, `1800`, `3600`, `86400`); anything else is rejected
+  naming `bar_interval_secs`.
+
+The pair is resolved to Kraken's **display** form before the banner prints
+(`XBT/USD` → `BTC/USD`, via the legacy-alias table in `src/kraken.rs`), so the
+banner, the session log line, the mock-trade lines and the persisted CSV
+filename all name the symbol actually streamed.
+
+```sh
+PRICE_ACTION_LIVE_FEED_SOURCE=kraken \
+PRICE_ACTION_SYMBOL=XBT/USD \
+PRICE_ACTION_BAR_INTERVAL_SECS=60 \
+  cargo run -- live
+```
 
 Configuration is loaded through `Config::load_for_live()`: full `Config::load`
 validation **plus** a resolvable market-data API key. Replay and the no-args
@@ -66,8 +107,10 @@ path are unaffected by the live-only keys.[^configsrc]
 
 ## What comes off the wire
 
-Transport lives in `src/feed.rs` and is deliberately socket-only — no bar
-logic, no clocks, no account state.[^feedrs]
+Transport lives in `src/feed.rs` (Massive) and `src/kraken.rs` (Kraken); both
+are deliberately socket-only — no bar logic, no clocks, no account state.[^feedrs][^krakenrs]
+
+### Massive.com stocks feed
 
 | Aspect | Behaviour |
 |---|---|
@@ -81,6 +124,21 @@ logic, no clocks, no account state.[^feedrs]
 | Other events | `status`, quotes and unknown feed types decode to **no** bar material |
 | Symbol filter | Events for other symbols are dropped (case-insensitive match) |
 | Secrets | The API key is only ever written into the auth frame; `FeedSettings`' `Debug` impl redacts it |
+
+### Kraken Spot WebSocket v2
+
+| Aspect | Behaviour |
+|---|---|
+| URL | `wss://ws.kraken.com/v2` — fixed; public channels only. The authenticated host is deliberately never used, so there is nothing to authenticate to |
+| Handshake | no auth frame: the client sends `{"method":"subscribe","params":{"channel":"ohlc","symbol":["BTC/USD"],"interval":<mins>}}` and waits for the `{"method":"subscribe", …, "success":true\|false}` ack (15s grace). Data/heartbeat/status frames arriving before the ack do not settle the wait |
+| Ack rejection | carries Kraken's own `error` string (e.g. *"Currency pair not supported XBT/USD"*), logged verbatim — it names the offending symbol and holds no credentials. That is why v2 gets a modern display pair: legacy wsnames, altnames and internal keys are all rejected by v2 itself |
+| `ohlc` **update** frames | one candle: `open`/`high`/`low`/`close`/`volume` plus both window edges as ISO-8601 UTC strings (`interval_begin`, `timestamp`), re-emitted with fresh numbers while the candle is in flight — the same hold-until-next-starts cadence the shaper implements |
+| `ohlc` **snapshot** frames | deliberately **ignored**: they are warm-up history (closed candles from long past) and booking them into a running session would price trades against stale prices; the in-flight candle arrives with final numbers through subsequent updates anyway |
+| `heartbeat` / `status` | decode to no events — which is what keeps the silence timeout from firing on an idle pair |
+| Symbol filter | data items for any other symbol are dropped (case-insensitive match against the resolved display pair) |
+| Unusable values | a non-finite or negative price/volume drops that item (the same policy the session applies to a rejected event) |
+| Volume display | the report formats volume as an integer (`v={:>10.0}`), so Kraken's fractional lot volumes (e.g. `0.31561871`) render as `0`/`1`. The persisted CSV keeps full `f64` precision — a rendering artifact, not data loss, and the shipping strategy never reads volume |
+| Secrets | none: no key exists for this endpoint, so nothing is redacted and nothing can leak |
 
 ### Reconnection
 
@@ -110,6 +168,12 @@ wrong close, wrong high/low, wrong volume. Consequences:
   long, so the dedupe anchor is always strictly after its start.
 - Bars lag the market by up to one window. That is the price of correct bars.
 
+The window length is the **source's**, not a constant: `60_000` ms for Massive's
+minute windows, `bar_interval_secs × 1000` for a Kraken session subscribed to
+that candle interval. Both the missing-`end_ms` fallback and the gap test below
+scale with it, so a session on 5-minute candles is not flagged as a data hole
+for every normally-spaced bar.[^livers]
+
 **Tick mode (`live_feed_channel = "ticks"`).** Trades accumulate into a bucket
 per UTC second — first price is the open, last is the close, high/low widen,
 size sums — and the bucket becomes a bar when a trade from a *different* second
@@ -119,8 +183,8 @@ older bar, and closing or replacing the held bucket on its arrival would have
 to truncate that bucket's true high/low/volume — the same rule minute mode
 applies to out-of-order windows.[^livers]
 
-**Data holes are reported, never hidden.** A jump of ≥ 1 full minute between
-windows annotates the *next* bar with `[feed gap: ~<n>s of missing windows
+**Data holes are reported, never hidden.** A jump of ≥ 1 full source window
+between windows annotates the *next* bar with `[feed gap: ~<n>s of missing windows
 before this bar]`; a jump of ≥ 2s between traded seconds annotates with
 `[feed gap: ~<n>s of missing ticks before this bar]`. A `FeedInterrupted`
 marker becomes `[feed interrupted; reconnecting]`, merged onto the same line
@@ -185,8 +249,10 @@ failures are logged and trading continues.[^mainrs][^livers]
 
 On stop the session writes every bar it consumed to
 `<live_csv_dir>/live-<SYMBOL>-<UTC stamp>.csv` in the
-[bar file format](bar-file-format.md), creating the directory if needed. When
-no bar arrived, nothing is written and the report says so.[^livers]
+[bar file format](bar-file-format.md), creating the directory if needed. `<SYMBOL>`
+is whatever the session actually traded — Massive's uppercased ticker (`AAPL`),
+or Kraken's resolved display pair (`BTC/USD`, even when configured as `XBT/USD`).
+When no bar arrived, nothing is written and the report says so.[^livers]
 
 That file is the audit trail: re-replaying it offline reproduces the session
 **by construction**, because both paths share one pipeline. The traces are
@@ -228,3 +294,5 @@ cancelled mid-flight.[^mainrs][^livers]
 [^replayrs]: `src/replay.rs`: `ReplaySession` (the shared per-bar pipeline), `annotate_last_trace`, `render_report(config, report, source, out)`
 
 [^configsrc]: `src/config.rs`: `load_for_live`/`load_live_from`, `validate_live_market_data`, `live_feed_host`/`live_feed_channel`/`massive_api_key`/`live_csv_dir`
+
+[^krakenrs]: `src/kraken.rs`: module doc (wire facts, verified live), `resolve_from_tables`/`resolve_pair`, `KrakenSettings`, `spawn_v2`/`v2_stream_once` (reconnect + `FeedInterrupted`), `decode_v2_frame` (update-only, symbol filter), `v2_subscribe_verdict`, `ALLOWED_INTERVALS_SECS`, `LEGACY_ASSET_NAMES`

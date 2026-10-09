@@ -36,7 +36,7 @@ use crate::{
     config::Config,
     csv,
     error::Error,
-    feed::{FeedChannel, FeedSettings, RawEvent, WindowUpdate},
+    feed::{FeedChannel, RawEvent, WindowUpdate},
     market::Bar,
     replay::{BarResult, ReplayReport, ReplaySession},
     strategy::Signal,
@@ -56,8 +56,8 @@ pub const EVENT_CHANNEL_SIZE: usize = 1024;
 /// unreachable) can never stall the session.
 pub const SUMMARY_CHANNEL_SIZE: usize = 16;
 
-/// One minute in Unix milliseconds — the aggregate feed's window length, and
-/// the silence that is still "normal" before a bar is called a data hole.
+/// One minute in Unix milliseconds — the Massive.com stocks feed's native
+/// window length (the fixed argument `run_session` passes for that source).
 const MINUTE_MS: u64 = 60_000;
 
 /// Seconds in a UTC day; the roll-up bucket boundary.
@@ -105,6 +105,11 @@ struct TickBucket {
 #[derive(Debug)]
 pub struct BarShaper {
     mode: ShaperMode,
+    /// Unix ms length of one upstream window (minute mode). Gap detection
+    /// and the missing-`end_ms` fallback both scale with it, because each
+    /// source streams its own granularity (Massive: 60s; Kraken: the candle
+    /// interval the session subscribed to).
+    window_ms: u64,
     /// Unix ms end of the last window turned into a bar (minute mode).
     last_window_end_ms: Option<u64>,
     /// The window currently being re-emitted upstream (minute mode).
@@ -122,11 +127,15 @@ enum ShaperMode {
 }
 
 impl BarShaper {
-    /// Native minute-window mode (one bar per traded minute).
+    /// Native per-window minute mode: one bar per upstream aggregate window,
+    /// which the feed re-emits with fresh numbers until the next one starts.
+    /// `window_ms` is the source's native window length (`60_000` for
+    /// Massive.com's minute windows; the Kraken candle interval).
     #[must_use]
-    pub const fn new_minute() -> Self {
+    pub const fn new_minute(window_ms: u64) -> Self {
         Self {
             mode: ShaperMode::Minute,
+            window_ms,
             last_window_end_ms: None,
             pending_window: None,
             tick_bucket: None,
@@ -138,6 +147,7 @@ impl BarShaper {
     pub const fn new_ticks() -> Self {
         Self {
             mode: ShaperMode::Ticks,
+            window_ms: 0, // unused in tick mode
             last_window_end_ms: None,
             pending_window: None,
             tick_bucket: None,
@@ -198,12 +208,12 @@ impl BarShaper {
         validate_money(w)?;
 
         let start_ms = w.start_ms;
-        // An absent or non-advancing end is treated as one interval long, so
+        // An absent or non-advancing end is treated as one window long, so
         // the dedupe anchor below is always strictly after the start.
         let end_ms = w
             .end_ms
             .filter(|end| *end > start_ms)
-            .unwrap_or_else(|| start_ms.saturating_add(MINUTE_MS));
+            .unwrap_or_else(|| start_ms.saturating_add(self.window_ms));
 
         let incoming = PendingWindow {
             start_ms,
@@ -238,12 +248,13 @@ impl BarShaper {
     }
 
     /// Turns a completed window into a bar, attaching a gap note when more
-    /// than one interval of windows is missing before it.
+    /// than one whole upstream window is missing before it (a source with 5m
+    /// candles must not be flagged for every normally-spaced bar).
     fn emit_window(&mut self, window: PendingWindow) -> Result<ShapedBar, Error> {
         let gap_note = match self.last_window_end_ms {
             Some(anchor) if window.start_ms > anchor => {
                 let miss_s = window.start_ms.saturating_sub(anchor) / 1_000;
-                (miss_s >= MINUTE_MS / 1_000).then(|| {
+                (miss_s >= self.window_ms / 1_000).then(|| {
                     format!("   [feed gap: ~{miss_s}s of missing windows before this bar]")
                 })
             }
@@ -620,6 +631,7 @@ impl SessionState {
                 config.quantity,
                 config.starting_balance,
                 config.trade_fee_bps,
+                config.max_leverage,
                 config.consecutive_closes_threshold,
             ),
             bars: Vec::new(),
@@ -693,24 +705,34 @@ impl SessionState {
 /// shared engine.
 pub async fn run_session(
     config: &Config,
-    settings: &FeedSettings,
+    symbol: &str,
     mut rx: mpsc::Receiver<RawEvent>,
     shutdown: impl Future<Output = ()>,
     summaries: mpsc::Sender<DailySummary>,
 ) -> Result<SessionOutput, Error> {
     let started_at = SystemTime::now();
+    // Native window length of the source feeding this session: Massive streams
+    // fixed 1m windows; Kraken's OHLC channel streams candles at `bar_interval_secs`
+    // (config validation guarantees that names one of its allowed set). Gap
+    // detection scales with it, so a 5-minute-candle feed is not flagged for
+    // every normally-spaced bar. The multiply saturates rather than panicking
+    // on an absurd bound: the result only feeds shaper bookkeeping.
+    let window_ms = match config.live_feed_source {
+        crate::config::FeedSource::Massive => MINUTE_MS,
+        crate::config::FeedSource::Kraken => config.bar_interval_secs.saturating_mul(1_000),
+    };
     let mut shaper = match config.live_feed_channel {
-        FeedChannel::Minute => BarShaper::new_minute(),
+        FeedChannel::Minute => BarShaper::new_minute(window_ms),
         FeedChannel::Ticks => BarShaper::new_ticks(),
     };
     let mut state = SessionState::new(config);
     let mut interruptions_before_first_bar = 0usize;
 
     eprintln!(
-        "live session started — symbol={} channel={} host={} bar_interval={}s threshold={}",
-        settings.symbol,
+        "live session started — symbol={} source={:?} channel={} bar_interval={}s threshold={}",
+        symbol,
+        config.live_feed_source,
         channel_label(config.live_feed_channel),
-        config.live_feed_host,
         config.bar_interval_secs,
         config.consecutive_closes_threshold,
     );
@@ -765,7 +787,7 @@ pub async fn run_session(
 
     // The day still in progress is reported too, marked partial: a session
     // stopped at 14:00 UTC has not seen midnight and should not pretend to.
-    if let Some(summary) = state.finish_day(&settings.symbol) {
+    if let Some(summary) = state.finish_day(symbol) {
         deliver_summary(&summaries, summary).await;
     }
 
@@ -784,7 +806,7 @@ pub async fn run_session(
     } = state;
     let bars_written = bars.len();
     let report = session.finish(last_close);
-    let csv_path = persist_bars(config, &settings.symbol, &bars, started_at)?;
+    let csv_path = persist_bars(config, symbol, &bars, started_at)?;
     Ok(SessionOutput {
         report,
         csv_path,
@@ -825,14 +847,22 @@ fn merge_notes(interrupt: Option<String>, jump: Option<String>) -> Option<String
 
 /// The live mock-trade log: one line per closed paper trade, with the size
 /// that would have been put down, the fees it would have paid and the account
-/// state afterwards. Stdout, so it pipes cleanly alongside the final report.
+/// state afterwards. A trade the simulation had to force closed because the
+/// leveraged position outgrew its maintenance margin carries a
+/// `[liquidated]` marker, so a leveraged session's log reads honestly about
+/// why the trade ended.
 fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, state: BarState) {
     println!(
-        "[{}] MOCK TRADE #{} {} {} x{} entry={} ({}) -> exit={} ({}) | \
+        "[{}] MOCK TRADE #{}{} {} {} x{} entry={} ({}) -> exit={} ({}) | \
          committed={:.2} fees={:.4} ({} bps/side) gross P/L={:+.2} net P/L={:+.2} | \
          cash={:.2} equity={:.2}",
         utc_stamp(bar_ts),
         trade.index,
+        if trade.liquidated {
+            " [liquidated]"
+        } else {
+            ""
+        },
         if trade.side_is_long { "LONG " } else { "SHORT" },
         config.symbol,
         config.quantity,
@@ -876,11 +906,12 @@ fn persist_bars(
 /// inputs (no clock reads inside), so tests can pin it.
 fn session_csv_path(dir: &str, symbol: &str, start: SystemTime) -> PathBuf {
     // `replace` rather than slicing: `string_slice`/`indexing_slicing` are
-    // deny lints outside tests.
+    // deny lints outside tests. `/` (pair symbols like `BTC/USD`) is mapped to
+    // `_` so the name cannot escape the CSV dir.
     let stamp = utc_stamp(start).replace(['-', ':'], "");
     Path::new(dir).join(format!(
         "live-{}-{stamp}.csv",
-        symbol.trim().to_ascii_uppercase()
+        symbol.trim().to_ascii_uppercase().replace('/', "_")
     ))
 }
 
@@ -945,18 +976,9 @@ mod tests {
         }
     }
 
-    fn settings() -> FeedSettings {
-        FeedSettings::for_stocks(
-            "socket.massive.com",
-            "k".into(),
-            "AAPL",
-            FeedChannel::Minute,
-        )
-    }
-
     #[test]
     fn minute_windows_are_held_until_the_next_one_starts() {
-        let mut shaper = BarShaper::new_minute();
+        let mut shaper = BarShaper::new_minute(MINUTE_MS);
         // First sight of a window: nothing emitted (it may still be updating).
         assert!(shaper.on_event(window(0, 100.0)).unwrap().is_empty());
         // Re-emission of the *same* window with fresher numbers: still nothing.
@@ -984,7 +1006,7 @@ mod tests {
 
     #[test]
     fn stale_windows_are_dropped_and_never_reopen_a_bar() {
-        let mut shaper = BarShaper::new_minute();
+        let mut shaper = BarShaper::new_minute(MINUTE_MS);
         shaper.on_event(window(0, 100.0)).unwrap();
         shaper.on_event(window(MINUTE_MS, 110.0)).unwrap();
         // A window older than the one in flight is out-of-order: ignored.
@@ -995,7 +1017,7 @@ mod tests {
 
     #[test]
     fn missing_minutes_produce_a_gap_note_on_the_next_bar() {
-        let mut shaper = BarShaper::new_minute();
+        let mut shaper = BarShaper::new_minute(MINUTE_MS);
         shaper.on_event(window(0, 100.0)).unwrap();
         shaper.on_event(window(MINUTE_MS, 110.0)).unwrap(); // closes the 0 window
                                                             // Jump to minute 4: minutes 2 and 3 never arrived. The hole is the
@@ -1074,7 +1096,7 @@ mod tests {
 
     #[test]
     fn cross_mode_events_and_interruptions_make_no_bars() {
-        let mut minute = BarShaper::new_minute();
+        let mut minute = BarShaper::new_minute(MINUTE_MS);
         assert!(minute.on_event(tick(1_000, 100.0, 1.0)).unwrap().is_empty());
         assert!(minute
             .on_event(RawEvent::FeedInterrupted)
@@ -1102,7 +1124,7 @@ mod tests {
             Err(Error::MarketData(_))
         ));
 
-        let mut minute = BarShaper::new_minute();
+        let mut minute = BarShaper::new_minute(MINUTE_MS);
         let bad_window = RawEvent::Window(WindowUpdate {
             close: f64::INFINITY,
             ..window_update(0, 100.0)
@@ -1124,6 +1146,105 @@ mod tests {
             Some("live-AAPL-20210119T180000Z.csv")
         );
         assert_eq!(path.parent().and_then(|p| p.to_str()), Some("./sessions"));
+    }
+
+    #[test]
+    fn session_csv_names_are_safe_for_pair_symbols() {
+        // `BTC/USD` must not escape the CSV dir through its slash.
+        let ts = ms_to_systemtime(1_611_079_200_000);
+        let path = session_csv_path("./sessions", "BTC/USD", ts);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("live-BTC_USD-20210119T180000Z.csv")
+        );
+        assert_eq!(path.parent().and_then(|p| p.to_str()), Some("./sessions"));
+    }
+
+    /// A wide (Kraken-style 5-minute) candle window as a wrapped event.
+    fn five_minute_window(start_ms: u64, close: f64) -> RawEvent {
+        RawEvent::Window(WindowUpdate {
+            symbol: "BTC/USD".into(),
+            start_ms,
+            end_ms: Some(start_ms + 5 * MINUTE_MS),
+            open: close - 1.0,
+            high: close + 1.0,
+            low: close - 2.0,
+            close,
+            volume: 42.0,
+        })
+    }
+
+    #[test]
+    fn wide_candle_feeds_do_not_false_flag_gaps_on_normal_spacing() {
+        // With the old 60s-scale detection, every normally-spaced 5-minute
+        // candle (300s apart) read as a ~300s "feed gap". The shaper must
+        // scale its hole threshold to the source's native window instead.
+        let w = 5 * MINUTE_MS; // one Kraken-style candle, in ms
+        let mut shaper = BarShaper::new_minute(w);
+
+        assert!(shaper
+            .on_event(five_minute_window(0, 100.0))
+            .unwrap()
+            .is_empty());
+        // Closes w(0) (no anchor yet): clean.
+        assert_eq!(
+            shaper.on_event(five_minute_window(w, 101.0)).unwrap().len(),
+            1
+        );
+        // Closes w(w): exactly one window after the anchor — NOT a gap.
+        let closed = shaper.on_event(five_minute_window(2 * w, 102.0)).unwrap();
+        assert_eq!(closed.len(), 1);
+        assert!(
+            closed[0].gap_note.is_none(),
+            "normal spacing must be quiet: {:?}",
+            closed[0].gap_note
+        );
+
+        // Two whole candles go missing (w(3w), w(4w)): the hole is reported on
+        // the first bar AFTER it, and its width names the actual missed time.
+        shaper.on_event(five_minute_window(5 * w, 103.0)).unwrap(); // closes pre-hole bar
+        let closed = shaper.on_event(five_minute_window(6 * w, 104.0)).unwrap();
+        assert_eq!(closed.len(), 1);
+        let note = closed[0].gap_note.as_deref().unwrap_or_default();
+        assert!(note.contains("feed gap"), "{note}");
+        assert!(note.contains("~600s"), "{note}"); // end of w(2w) → start of w(5w)
+    }
+
+    #[tokio::test]
+    async fn a_kraken_labeled_session_writes_a_pair_safe_csv() {
+        let dir = std::env::temp_dir().join("price-action-live-test-kraken-name");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config {
+            live_feed_source: crate::config::FeedSource::Kraken,
+            live_csv_dir: dir.display().to_string(),
+            ..Config::default()
+        };
+
+        let (tx, rx) = mpsc::channel::<RawEvent>(EVENT_CHANNEL_SIZE);
+        for (i, close) in [100.0, 101.0, 102.0].iter().enumerate() {
+            let start = u64::try_from(i).unwrap() * MINUTE_MS;
+            tx.send(window(start, *close)).await.unwrap();
+        }
+        drop(tx); // closes the channel → the session ends
+
+        let (sum_tx, sum_rx) = mpsc::channel(SUMMARY_CHANNEL_SIZE);
+        let output = run_session(&config, "BTC/USD", rx, std::future::pending::<()>(), sum_tx)
+            .await
+            .unwrap();
+        drop(sum_rx); // session already returned; buffered summaries are not under test
+
+        assert_eq!(output.report.bars, 3);
+        // `output` has no further uses: move the path out instead of cloning.
+        let path = output.csv_path.unwrap();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        assert!(name.starts_with("live-BTC_USD-"), "{name}");
+        // The CSV round-trips through the replay loader.
+        let bars = crate::csv::load_bars(&path).unwrap();
+        assert_eq!(bars.len(), 3);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -1150,8 +1271,7 @@ mod tests {
         shutdown: impl Future<Output = ()>,
     ) -> (SessionOutput, Vec<DailySummary>) {
         let (sum_tx, mut sum_rx) = mpsc::channel(SUMMARY_CHANNEL_SIZE);
-        let feed_settings = settings();
-        let output = run_session(config, &feed_settings, rx, shutdown, sum_tx)
+        let output = run_session(config, "AAPL", rx, shutdown, sum_tx)
             .await
             .unwrap();
         let mut summaries = Vec::new();

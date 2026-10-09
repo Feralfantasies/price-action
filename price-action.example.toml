@@ -33,6 +33,15 @@ starting_balance = 10000
 # (>= 0; 5 = 0.05% of each leg's notional; 0 disables fees).
 trade_fee_bps = 5
 
+# Maximum leverage a paper position may carry (>= 1, <= 100; 1 = unleveraged).
+# Above 1 the position controls quantity*leverage units of notional: fees and
+# P/L price that leveraged notional, while the capital committed stays the
+# required margin (quantity*close). A position whose required margin marked
+# equity can no longer support is force-closed ("liquidated") at that bar's
+# close. Leveraged runs print extra report columns and totals rows; 1x output
+# is unchanged. See docs/paper-trading-accounting.md.
+max_leverage = 1
+
 # Broker/venue API base URL — required in live mode.
 # broker_url = "https://broker.example/api"
 
@@ -44,6 +53,14 @@ trade_fee_bps = 5
 # Live market-data session (`price-action live`) — paper execution only.
 # These keys are read on every load path but only used by `live`.
 # ---------------------------------------------------------------------------
+
+# Which market data `live` streams from:
+#   "massive" — Massive.com stocks WebSocket (the default; authenticated,
+#               needs massive_api_key below)
+#   "kraken"  — Kraken Spot WebSocket v2 `ohlc` channel: PUBLIC, no key exists
+#               for it and none is read. Minute channel only; bars are Kraken's
+#               candles at bar_interval_secs (1m/5m/15m/30m/1h/1d).
+live_feed_source = "massive"
 
 # Massive.com socket host: a BARE hostname (no scheme, path or whitespace).
 # `live` builds wss://<host>/stocks from it.
@@ -60,7 +77,8 @@ live_feed_channel = "minute"
 
 # Massive.com API key. SECRET — strongly prefer the
 # PRICE_ACTION_MASSIVE_API_KEY environment variable or a mounted secret over
-# committing it here. Required by `live`; never needed for replay.
+# committing it here. Required by `live` only when live_feed_source = "massive";
+# never needed for replay, and never read for the public Kraken source.
 # massive_api_key = "..."
 
 # Directory where `live` writes each session's bars as a replay-compatible CSV
