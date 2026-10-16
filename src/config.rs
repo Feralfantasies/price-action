@@ -151,6 +151,22 @@ pub struct Config {
     /// Massive.com API key for the market-data feed. Secret — prefer the
     /// environment variable over committing it to a config file.
     pub massive_api_key: Option<String>,
+    /// Kraken Spot **trade-API** key, used for one optional read-only
+    /// authenticated check (see [`kraken::authenticated_check`]): it asks Kraken
+    /// for account/pair info and **no order is ever sent** — this repo has no
+    /// order path at all, so a key can only ever read. Public market data needs
+    /// no key, and none is read when these are absent.
+    ///
+    /// Deliberately **environment-only**: [`FileConfig`] has no key for either
+    /// half and rejects unknown keys outright, so a committed `config.toml`
+    /// cannot carry one. Inject them at run time from a secret manager
+    /// (`op run -- env=PRICE_ACTION_KRAKEN_API_KEY --`), never export them into
+    /// a file, and never print them: both are redacted in `Debug`.
+    pub kraken_api_key: Option<String>,
+    /// The base64 API **secret** that pairs with [`kraken_api_key`]; it signs
+    /// each private request. Same rules as the key: environment-only, redacted,
+    /// and both halves must be set together (enforced where the check runs).
+    pub kraken_private_key: Option<String>,
     /// Directory where `live` persists its session CSV; see
     /// [`DEFAULT_LIVE_CSV_DIR`] (used when unset in every layer).
     pub live_csv_dir: String,
@@ -204,6 +220,8 @@ impl Default for Config {
             live_feed_channel: crate::feed::FeedChannel::Minute,
             live_feed_source: FeedSource::Massive,
             massive_api_key: None,
+            kraken_api_key: None,
+            kraken_private_key: None,
             live_csv_dir: DEFAULT_LIVE_CSV_DIR.to_string(),
             telegram_bot_token: None,
             telegram_chat_id: None,
@@ -435,6 +453,15 @@ impl Config {
         if let Some(v) = env("PRICE_ACTION_MASSIVE_API_KEY") {
             self.massive_api_key = Some(v);
         }
+        // Environment-only on purpose (see the fields' docs): a Kraken key that
+        // could be committed by accident is rejected in the file, so the only
+        // way to supply one is a secret manager injecting it into the process.
+        if let Some(v) = env("PRICE_ACTION_KRAKEN_API_KEY") {
+            self.kraken_api_key = Some(v);
+        }
+        if let Some(v) = env("PRICE_ACTION_KRAKEN_PRIVATE_KEY") {
+            self.kraken_private_key = Some(v);
+        }
         if let Some(v) = env("PRICE_ACTION_LIVE_CSV_DIR") {
             self.live_csv_dir = v;
         }
@@ -612,6 +639,14 @@ impl fmt::Debug for Config {
             .field(
                 "massive_api_key",
                 &self.massive_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "kraken_api_key",
+                &self.kraken_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "kraken_private_key",
+                &self.kraken_private_key.as_ref().map(|_| "[redacted]"),
             )
             .field("live_csv_dir", &self.live_csv_dir)
             .field(
@@ -969,6 +1004,38 @@ massive_api_key = "file-key"
         let cfg = Config::load_live_from(&no_file(), &env).unwrap();
         let debug = format!("{cfg:?}");
         assert!(!debug.contains("feed-secret-value"), "{debug}");
+    }
+
+    #[test]
+    fn a_kraken_key_pair_comes_from_the_environment_only() {
+        let env = env_from(BTreeMap::from([
+            ("PRICE_ACTION_KRAKEN_API_KEY", "env-key-value"),
+            ("PRICE_ACTION_KRAKEN_PRIVATE_KEY", "env-secret-value"),
+            (
+                // The live loader only demands a Massive key when the feed
+                // source is Massive; the Kraken key pair is orthogonal to it.
+                "PRICE_ACTION_LIVE_FEED_SOURCE",
+                "kraken",
+            ),
+        ]));
+        let cfg = Config::load_live_from(&no_file(), &env).unwrap();
+        assert_eq!(cfg.kraken_api_key.as_deref(), Some("env-key-value"));
+        assert_eq!(cfg.kraken_private_key.as_deref(), Some("env-secret-value"));
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("env-key-value"), "{debug}");
+        assert!(!debug.contains("env-secret-value"), "{debug}");
+    }
+
+    #[test]
+    fn a_kraken_key_written_in_the_config_file_is_rejected() {
+        let path = write_temp_config(
+            r#"
+symbol = "BTC/USD"
+kraken_api_key = "file-key"
+"#,
+        );
+        let err = Config::load_live_from(&path, &env_from(BTreeMap::new())).unwrap_err();
+        assert!(err.to_string().contains("kraken_api_key"), "{err}");
     }
 
     #[test]

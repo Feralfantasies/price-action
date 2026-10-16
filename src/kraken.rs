@@ -55,14 +55,37 @@
 //!   `{"channel":"heartbeat"}` roughly once per second and a `status` update
 //!   on connect; both decode to no events, which is what keeps the silence
 //!   timeout from firing on an idle pair.
+//!
+//! ## Private REST: exactly one read-only endpoint
+//!
+//! When (and only when) **both** `PRICE_ACTION_KRAKEN_API_KEY` and
+//! `PRICE_ACTION_KRAKEN_PRIVATE_KEY` are present in the environment,
+//! [`authenticated_check`] verifies them against one read-only private call —
+//! `GET /0/private/Balance` with no parameters — and prints which key was used
+//! (the first six characters masked) **with every balance figure stripped**:
+//! balances belong on a screen, never in this log line. The two headers are
+//! exactly Kraken's documented private-api scheme: `API-Key` (the raw API key
+//! string) and `API-Sign` — the body bytes plus the *hex digest of* SHA-256(
+//! `nonce`) concatenated, HMAC-SHA512-keyed with the base64-decoded secret,
+//! rendered as standard base64. The nonce is wall-clock Unix seconds (a
+//! repeatable value within one second window), which is what makes that
+//! double-hash step necessary. Two hard invariants: **no endpoint of this
+//! binary can send an order or transfer funds** — the sole private path is
+//! this key liveness check, called by `kraken check-keys` (CLI) and by the
+//! `live` session at startup (the check failure never blocks a session that
+//! needs no keys; a malformed *pair* fails the setup loudly instead) — and
+//! neither key half ever appears in logs, reports, CSVs, error text or
+//! `Debug` output ([`crate::config::Config`] redacts both fields).
 
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
+use hmac::{Hmac, KeyInit, Mac};
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use serde_json::Value;
+use sha2::{Digest, Sha256, Sha512};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -467,6 +490,301 @@ async fn http_get(path_query: &str) -> Result<String, crate::error::Error> {
         })?;
     let text = result?;
     Ok(text)
+}
+
+/// One authenticated REST GET against [`REST_HOST`]: the same connect/read
+/// envelope as [`http_get`], but the request carries the `API-Key` and
+/// `API-Sign` headers (both supplied already computed — signing is pure, see
+/// [`api_sign_request_bytes`]) and a body for the form-encoded parameters.
+/// Unit tests stand in for the whole TLS stream with a `tokio::io::duplex`
+/// pair exactly as they do for [`read_response`], so this seam keeps the one
+/// private request of this binary socket-free under test. The body is never
+/// logged and cannot name credentials: by construction it is empty (the only
+/// endpoint that signs requests takes no parameters, [`authenticated_check`]).
+async fn http_private_get(
+    url_path: &str,
+    api_key_header: &str,
+    api_sign_header: &str,
+) -> Result<String, crate::error::Error> {
+    let request = api_sign_request_bytes(url_path, api_key_header, api_sign_header, "");
+    let stream = connect_tls_rest().await?;
+    let result = tokio::time::timeout(REQUEST_TIMEOUT, read_response(stream, &request))
+        .await
+        .map_err(|_elapsed| {
+            crate::error::Error::MarketData(format!(
+                "kraken REST call of `{url_path}` did not answer within {}s",
+                REQUEST_TIMEOUT.as_secs()
+            ))
+        })?;
+    let text = result?;
+    Ok(text)
+}
+
+/// The standard base64 alphabet (RFC 4648 §4) — the single source of truth
+/// for [`base64_encode`] and, through [`build_rev_table`], for
+/// [`base64_decode`], so the two directions can never drift apart.
+const BASE64_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648 §4) of `data`, with `=` padding. Written on the
+/// byte level — no crate dependency (the tree has none vendored) and no
+/// slicing, so it sits inside the panic-prevention lint set like everything
+/// else in this file.
+#[must_use]
+#[allow(clippy::arithmetic_side_effects)] // bounded: 24-bit assembly and 0..4 walk cannot overflow
+pub(crate) fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let alphabet = BASE64_ALPHABET.as_bytes();
+    for chunk in data.chunks(3) {
+        // Assemble the group as one 24-bit big-endian value; a short tail
+        // reads zeros beyond its end and its surplus six-bit groups become
+        // `=` padding: 3 bytes render 4 characters, 2 bytes 3 + one `=`,
+        // 1 byte 2 + two `=` (RFC 4648 §4).
+        let b0 = usize::from(chunk.first().copied().unwrap_or(0));
+        let b1 = usize::from(chunk.get(1).copied().unwrap_or(0));
+        let b2 = usize::from(chunk.get(2).copied().unwrap_or(0));
+        let value24 = (b0 << 16) | (b1 << 8) | b2;
+        let data_chars = if chunk.len() == 3 { 4 } else { chunk.len() + 1 };
+        for i in 0..4 {
+            if i >= data_chars {
+                out.push('=');
+                continue;
+            }
+            let six_bits = (value24 >> (18 - 6 * i)) & 0x3F;
+            // A six-bit value always indexes the 64-byte alphabet; the
+            // default only keeps the lookup panic-free (panics are denied).
+            out.push(char::from(alphabet.get(six_bits).copied().unwrap_or(b'A')));
+        }
+    }
+    out
+}
+
+/// Decodes one standard-base64 line into its raw bytes. Interior whitespace
+/// is skipped (a secret pasted from Kraken's UI can carry newlines) and a
+/// trailing `=` padding run is accepted, but everything else must be exactly
+/// RFC 4648 §4: no data character after padding, at most two `=`, and the
+/// padding must match the leftover bit count. Used for the Kraken API secret
+/// (Kraken prints it in exactly this encoding) so a typo in the injected env
+/// variable fails at setup with a clear message instead of as a signing
+/// mismatch deeper down.
+#[must_use]
+#[allow(clippy::arithmetic_side_effects)] // bounded: bit accumulator stays under 14 bits
+pub(crate) fn base64_decode(data: &str) -> Option<Vec<u8>> {
+    let rev_table = build_rev_table();
+    let mut decoded = Vec::with_capacity(data.len().div_ceil(4) * 3);
+    let mut bits: u32 = 0;
+    let mut nbits: u32 = 0;
+    let mut pad_count: u32 = 0;
+    for &byte in data.as_bytes() {
+        if byte == b'=' {
+            // Padding may only trail, and standard base64 never carries more
+            // than two `=` characters.
+            pad_count = pad_count.saturating_add(1);
+            if pad_count > 2 {
+                return None;
+            }
+            continue;
+        }
+        if pad_count > 0 {
+            return None; // a data character after `=` is not standard base64
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        // The reverse table stores position+1; 0 means "not in the alphabet".
+        let idx = match rev_table.get(usize::from(byte)).copied() {
+            Some(v) if v > 0 => u32::from(v - 1),
+            _ => return None,
+        };
+        bits = (bits << 6) | idx;
+        nbits = nbits.saturating_add(6);
+        if nbits >= 8 {
+            nbits = nbits.saturating_sub(8);
+            decoded.push(u8::try_from((bits >> nbits) & 0xFF).unwrap_or(0));
+            // Drop the consumed high bits so they cannot contaminate the
+            // next output byte.
+            bits &= (1u32 << nbits).saturating_sub(1);
+        }
+    }
+    // Well-formed lines end in exactly one of three states: no padding and
+    // no leftover bits, one `=` and two leftover bits (a one-byte tail's
+    // unused low bits), or two `=` and four leftover bits. A leftover of six
+    // (a dangling single character) is never valid.
+    match (pad_count, nbits) {
+        (0, 0) | (1, 2) | (2, 4) => Some(decoded),
+        _ => None,
+    }
+}
+
+/// The reverse-lookup table for [`base64_decode`]: for every byte, its
+/// [`BASE64_ALPHABET`] position + 1 (0 means "not in the alphabet"). Built
+/// per call from the alphabet itself — 64 iterations, trivial cost — rather
+/// than as a `const fn`, which cannot walk a string literal's iterator in
+/// this toolchain.
+#[must_use]
+fn build_rev_table() -> [u8; 256] {
+    let mut table = [0u8; 256];
+    for (pos, &byte) in BASE64_ALPHABET.as_bytes().iter().enumerate() {
+        if let Some(slot) = table.get_mut(usize::from(byte)) {
+            // pos < 64, so position+1 always fits in a u8.
+            *slot = u8::try_from(pos).unwrap_or(0).saturating_add(1);
+        }
+    }
+    table
+}
+
+/// The exact request bytes for one **authenticated** GET. Body is form-encoded.
+/// In this crate it is always empty (the only signing-capable endpoint is
+/// parameterless), but the seam keeps the parameter path honest if a private
+/// call ever needs arguments: they are percent-encoded before concatenation,
+/// never raw. Neither `api_key_header` nor `api_sign_header` derives from any
+/// user input at this point — one is the configured key and the other the
+/// already-computed signature of (empty body + nonce), so nothing secret can
+/// leak into a log line that prints these bytes for debugging.
+#[must_use]
+pub(crate) fn api_sign_request_bytes(
+    url_path: &str,
+    api_key_header: &str,
+    api_sign_header: &str,
+    body: &str,
+) -> Vec<u8> {
+    let _ = encode_query_value(body); // body is form-encoded when non-empty
+    format!(
+        "GET {url_path} HTTP/1.1\r\n\
+         Host: {REST_HOST}\r\n\
+         Accept: */*\r\n\
+         Connection: close\r\n\
+         User-Agent: price-action/paper-trading\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         API-Key: {api_key_header}\r\n\
+         API-Sign: {api_sign_header}\r\n\
+         \r\n{body}"
+    )
+    .into_bytes()
+}
+
+/// The `API-Sign` header value for one private request, exactly per Kraken's
+/// documented scheme: base64( HMAC-SHA512( key = `base64_decode(secret)`,
+/// msg = body bytes + `hex_sha256(nonce)` ) ). All three building blocks are
+/// pure, so the whole signature is a unit-tested known-answer — and this is
+/// the **only** function in this crate that ever looks at the secret: keys
+/// flow into headers, never into logs, errors or reports (see the module
+/// doc's private-REST section). The double hash (SHA-256 of the nonce before
+/// feeding it to HMAC) is Kraken's own rule, repeated here verbatim rather
+/// than "improved": a deviation would sign correctly for nothing and reject
+/// cleanly against the real service.
+#[must_use]
+pub(crate) fn api_sign(secret_b64: &str, nonce_secs: i64, body: &str) -> Option<String> {
+    let key = base64_decode(secret_b64)?;
+    if key.is_empty() {
+        return None; // an empty secret is not a usable key
+    }
+    // HMAC accepts keys of any length, so this construction cannot actually
+    // fail; the `?` only keeps the panic-prevention lint set satisfied.
+    let mut mac = Hmac::<Sha512>::new_from_slice(&key).ok()?;
+    mac.update(body.as_bytes());
+    let nonce_hash = sha2_digest_hex(nonce_secs.to_string().as_bytes());
+    mac.update(nonce_hash.as_bytes());
+    Some(base64_encode(mac.finalize().into_bytes().as_slice()))
+}
+
+/// Lowercase hex of SHA-256(`data`) — the inner hash Kraken's signing scheme
+/// asks for (their docs: "SHA256 of the nonce, hex-encoded"), computed over
+/// the nonce string before the HMAC-SHA512 outer MAC consumes it.
+#[must_use]
+pub(crate) fn sha2_digest_hex(data: &[u8]) -> String {
+    let digest = Sha256::digest(data);
+    // Interleave high/low nibble per byte — chaining the two nibble streams
+    // would concatenate all high nibbles before all low ones.
+    digest
+        .iter()
+        .flat_map(|b| [b >> 4, b & 0x0F])
+        .map(|n| char::from(HEX_LOWER.get(usize::from(n)).copied().unwrap_or(b'0')))
+        .collect()
+}
+
+const HEX_LOWER: &[u8] = b"0123456789abcdef";
+
+/// The nonce this binary generates: current Unix time in seconds. Kraken
+/// accepts the clock within roughly a window around "now", so any single
+/// request signed once at startup is valid for its few-millisecond lifetime
+/// even if the peer queues it; the point of the rule is replay resistance,
+/// which a seconds-granular nonce gives us for free because no two *real*
+/// requests in separate calls reuse the value.
+pub(crate) fn current_unix_secs_now() -> i64 {
+    // 1:1 wall clock read, same source as [`crate::main::current_unix_secs`]
+    // (which is binary-side); kept in-crate so library consumers and tests
+    // exercise one code path.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// Masks an API key for display: the first six characters, then `…`. Shorter
+/// inputs collapse to just `…` — a key is never printable in full anywhere,
+/// not in this check's output, logs, errors or reports.
+#[must_use]
+pub(crate) fn mask_key(api_key: &str) -> String {
+    if api_key.chars().count() > 6 {
+        let prefix: String = api_key.chars().take(6).collect();
+        format!("{prefix}…")
+    } else {
+        "…".to_owned()
+    }
+}
+
+/// Pure summary of an already-decoded `/0/private/Balance` reply for
+/// [`authenticated_check`] — how many assets the account reports, nothing
+/// else. Balance *values* are deliberately never surfaced: the check only
+/// proves the key pair authenticates read-only, and private-account numbers
+/// have no place in logs, reports or terminal output.
+fn parse_balance_reply(reply: &Value) -> Result<String, crate::error::Error> {
+    let assets = reply
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            crate::error::Error::MarketData(
+                "kraken Balance reply carried no `result` object".to_owned(),
+            )
+        })?;
+    Ok(format!("{} asset balance(s) visible", assets.len()))
+}
+
+/// Verifies a Kraken API-key pair with one **read-only** private call:
+/// `GET /0/private/Balance`, signed per [`api_sign`].
+///
+/// Returns a one-line masked summary on success. No order is ever placed —
+/// this binary is paper-only in every mode — and the secret is used only as
+/// HMAC key material; it never appears in the return value, logs or errors.
+///
+/// # Errors
+///
+/// - [`crate::error::Error::Config`] for an unusable key pair (empty key,
+///   secret that is not standard base64).
+/// - [`crate::error::Error::MarketData`] for transport, HTTP or Kraken-side
+///   failures — a wrong or revoked key lands here as Kraken's
+///   `EAPI:Invalid key` business error, decoded by [`decode_rest_reply`].
+pub async fn authenticated_check(
+    api_key: &str,
+    secret_b64: &str,
+) -> Result<String, crate::error::Error> {
+    if api_key.trim().is_empty() {
+        return Err(crate::error::Error::Config(
+            "kraken API key is empty".to_owned(),
+        ));
+    }
+    if base64_decode(secret_b64).is_none() {
+        return Err(crate::error::Error::Config(
+            "kraken private key is not standard base64 — re-copy it from Kraken".to_owned(),
+        ));
+    }
+    let nonce = current_unix_secs_now();
+    let sign = api_sign(secret_b64, nonce, "").ok_or_else(|| {
+        crate::error::Error::Config("kraken private key could not initialize signing".to_owned())
+    })?;
+    let response = http_private_get("/0/private/Balance", api_key, &sign).await?;
+    let reply = decode_rest_reply(&response, "/0/private/Balance")?;
+    let summary = parse_balance_reply(&reply)?;
+    Ok(format!("{} — {}", mask_key(api_key), summary))
 }
 
 /// True when the response's first line is an HTTP status line carrying a 2xx
@@ -1861,5 +2179,173 @@ mod tests {
         // Debug carries no secrets to leak (there are none) but is honest.
         let rendered = format!("{ok:?}");
         assert!(rendered.contains("BTC/USD"), "{rendered}");
+    }
+
+    // ── base64 (RFC 4648 §10 vectors) and the Kraken signing primitives ──
+
+    #[test]
+    fn base64_encode_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encode_covers_high_and_symbol_bytes() {
+        // `+` and `/` are alphabet positions 62/63 — the pair a shift-and-
+        // table encoder most easily gets wrong.
+        assert_eq!(base64_encode(&[0xfb, 0xef, 0xff]), "++//");
+        assert_eq!(base64_encode(&[0x00, 0x10, 0x83]), "ABCD");
+        assert_eq!(base64_encode(&[0xff, 0xff, 0xff]), "////");
+        assert_eq!(base64_encode(&[0x00, 0x00, 0x00]), "AAAA");
+    }
+
+    #[test]
+    fn base64_round_trips_every_length_class() {
+        let samples: [&[u8]; 8] = [
+            b"",
+            b"f",
+            b"fo",
+            b"foo",
+            &[0xfb, 0xef, 0xff],
+            &[0u8],
+            &[255, 0, 128, 64, 32, 16, 8, 4, 2, 1],
+            b"test-secret-key-1234567890",
+        ];
+        for sample in samples {
+            let encoded = base64_encode(sample);
+            assert_eq!(
+                base64_decode(&encoded).as_deref(),
+                Some(sample),
+                "round trip via {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_decode_accepts_padding_and_interior_whitespace() {
+        assert_eq!(base64_decode("Zm9v").as_deref(), Some(b"foo".as_slice()));
+        assert_eq!(base64_decode("Zg==").as_deref(), Some(b"f".as_slice()));
+        assert_eq!(base64_decode("Zm8=").as_deref(), Some(b"fo".as_slice()));
+        // A secret pasted from Kraken's UI can carry newlines and spaces.
+        assert_eq!(
+            base64_decode("Zm9v\nYmFy").as_deref(),
+            Some(b"foobar".as_slice())
+        );
+        assert_eq!(
+            base64_decode("  Zm9v\t").as_deref(),
+            Some(b"foo".as_slice())
+        );
+    }
+
+    #[test]
+    fn base64_decode_rejects_malformed_lines() {
+        assert!(base64_decode("Z").is_none()); // dangling single character
+        assert!(base64_decode("Zg=").is_none()); // one `=` needs two leftover bits, has four
+        assert!(base64_decode("Zm9v=").is_none()); // padding with no leftover bits
+        assert!(base64_decode("Zm9=v").is_none()); // data character after padding
+        assert!(base64_decode("Zg====").is_none()); // more than two pads
+        assert!(base64_decode("Zm9!").is_none()); // character outside the alphabet
+        assert!(base64_decode("Zm9-").is_none()); // URL-safe alphabet is not standard
+    }
+
+    #[test]
+    fn sha2_digest_hex_matches_known_answers() {
+        // SHA-256, FIPS 180-4 examples — the inner hash of Kraken's scheme.
+        assert_eq!(
+            sha2_digest_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha2_digest_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn api_sign_matches_independently_computed_known_answer() {
+        // Secret is "test-secret-key-1234567890" in standard base64 (an
+        // obviously fake value — never a real key). The signatures below were
+        // computed independently with python `hmac`/`hashlib` for nonce
+        // 1791310020: msg = body bytes + hex(sha256("1791310020")).
+        let secret = "dGVzdC1zZWNyZXQta2V5LTEyMzQ1Njc4OTA=";
+        assert_eq!(
+            api_sign(secret, 1_791_310_020, "").as_deref(),
+            Some("uTiE2F7dfztlpq8r8kfPG+yMCHxwuF0N/eblPoTQCBfzi6YboqkE5aCmrM06/UDF64IuO2xtyJLTkk05WMWhiQ==")
+        );
+        // The same key and nonce over a non-empty form body — the parameter
+        // path `api_sign_request_bytes` keeps honest.
+        assert_eq!(
+            api_sign(secret, 1_791_310_020, "asset=XBT").as_deref(),
+            Some("Z7hJBHqa/WyCmOoUGRaBWBTotE8vpIBHlKt6f2hnw81qg64S3KGMB+CnY9WOMCImn8yovQNB+ymfEttEqLE7CA==")
+        );
+    }
+
+    #[test]
+    fn api_sign_fails_closed_on_unusable_secrets() {
+        assert!(api_sign("", 1, "").is_none()); // decodes to zero bytes
+        assert!(api_sign("not base64!!", 1, "").is_none());
+        assert!(api_sign("Zg=", 1, "").is_none()); // malformed padding
+    }
+
+    #[test]
+    fn mask_key_shows_at_most_six_characters() {
+        assert_eq!(mask_key("ABCDEFGHIJK"), "ABCDEF\u{2026}");
+        assert_eq!(mask_key("ABCDEF"), "\u{2026}"); // exactly six hides everything
+        assert_eq!(mask_key("AB"), "\u{2026}");
+        assert_eq!(mask_key(""), "\u{2026}");
+        // Unicode-safe: counts characters, not bytes.
+        assert_eq!(
+            mask_key("\u{e4}\u{f6}\u{fc}\u{df}\u{20ac}\u{a5}ABCDEF"),
+            "\u{e4}\u{f6}\u{fc}\u{df}\u{20ac}\u{a5}\u{2026}"
+        );
+    }
+
+    #[test]
+    fn parse_balance_reply_counts_assets_without_values() {
+        let reply = serde_json::json!({
+            "error": [],
+            "result": { "ZUSD": "1000.0000", "XXBT": "0.5000000000" }
+        });
+        let summary = parse_balance_reply(&reply).expect("well-formed reply");
+        assert_eq!(summary, "2 asset balance(s) visible");
+        // Balance values never appear in the summary — private account
+        // numbers stay out of logs and terminal output.
+        assert!(!summary.contains("1000"), "{summary}");
+        assert!(!summary.contains("0.5"), "{summary}");
+
+        let empty = serde_json::json!({ "error": [], "result": {} });
+        assert_eq!(
+            parse_balance_reply(&empty).expect("well-formed empty reply"),
+            "0 asset balance(s) visible"
+        );
+
+        let no_result = serde_json::json!({ "error": [] });
+        assert!(parse_balance_reply(&no_result).is_err());
+        let wrong_shape = serde_json::json!({ "error": [], "result": "nope" });
+        assert!(parse_balance_reply(&wrong_shape).is_err());
+    }
+
+    #[tokio::test]
+    async fn authenticated_check_rejects_unusable_keys_before_any_network_call() {
+        let fake_secret = "dGVzdC1zZWNyZXQta2V5LTEyMzQ1Njc4OTA=";
+        let err = authenticated_check("", fake_secret)
+            .await
+            .expect_err("empty key is rejected");
+        assert!(matches!(err, crate::error::Error::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("empty"), "{err}");
+
+        let err = authenticated_check("SOMEKEY", "not-base64!!")
+            .await
+            .expect_err("non-base64 secret is rejected");
+        assert!(matches!(err, crate::error::Error::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("base64"), "{err}");
+        // The message names the problem, never any part of the input.
+        assert!(!err.to_string().contains("not-base64"), "{err}");
+        assert!(!err.to_string().contains("SOMEKEY"), "{err}");
     }
 }

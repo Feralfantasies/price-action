@@ -10,6 +10,11 @@
 //!   pair from Kraken's public REST endpoint and runs them through the same
 //!   funded paper account as replay — real market history, fake money, no
 //!   orders; or
+//! - with `kraken check-keys`, verifies an optionally injected read-only
+//!   Kraken API-key pair (`PRICE_ACTION_KRAKEN_API_KEY` +
+//!   `PRICE_ACTION_KRAKEN_PRIVATE_KEY`) with one signed read of the account
+//!   balance and prints a masked summary — no order is ever sent;
+//!   or
 //! - with `live`, streams real-time bars — from the Massive.com stocks
 //!   WebSocket (the default source, which takes an API key) or Kraken's
 //!   public Spot WebSocket v2 OHLC channel (`PRICE_ACTION_LIVE_FEED_SOURCE=
@@ -39,7 +44,7 @@ fn main() {
 }
 
 /// Usage line shared by every argument-error path.
-const USAGE: &str = "usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | live> \u{2014} e.g. `price-action replay samples/sample-bars.csv`";
+const USAGE: &str = "usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | kraken check-keys | live> \u{2014} e.g. `price-action replay samples/sample-bars.csv`";
 
 fn run() -> Result<(), Error> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -61,10 +66,15 @@ fn run() -> Result<(), Error> {
         [first, second, rest @ ..] if first == "kraken" && second == "backtest" => {
             run_kraken_backtest(rest)
         }
+        // `kraken check-keys` — no flags; the key pair comes from the
+        // environment only (see `run_kraken_check_keys`).
+        [first, second, rest @ ..] if first == "kraken" && second == "check-keys" => {
+            run_kraken_check_keys(rest)
+        }
         // `kraken <something else>`: name the wrong subcommand instead of a
         // generic unknown command.
         [first, second, ..] if first == "kraken" => Err(Error::Config(format!(
-            "`kraken`'s only subcommand is `backtest`, not `{second}`\n{USAGE}"
+            "`kraken`'s subcommands are `backtest` and `check-keys`, not `{second}`\n{USAGE}"
         ))),
         // Two or more arguments whose first is not a known subcommand:
         // rejected via the shared usage error.
@@ -89,6 +99,59 @@ fn run_replay(path: &str) -> Result<(), Error> {
 
 /// `--interval` fallback when the flag is absent: 5-minute candles.
 const DEFAULT_KRAKEN_INTERVAL_SECS: u32 = 300;
+
+/// `kraken check-keys` — verifies the optional read-only Kraken API-key pair
+/// with one signed `GET /0/private/Balance` (see
+/// [`kraken::authenticated_check`]) and prints a masked one-line summary.
+/// **No order is ever sent** — this crate has no order path at all.
+///
+/// The two env variables are read directly here rather than through
+/// [`Config`]: the subcommand exists precisely to diagnose the key pair, so
+/// it must work even when no config file is present, and it must not require
+/// any unrelated setting to be valid. The names match the config fields
+/// `kraken_api_key` / `kraken_private_key` (both environment-only by design,
+/// see `config.rs`).
+fn run_kraken_check_keys(rest: &[String]) -> Result<(), Error> {
+    if let [extra, ..] = rest {
+        return Err(Error::Config(format!(
+            "`kraken check-keys` takes no arguments (got `{extra}`)\n{USAGE}"
+        )));
+    }
+    let api_key = env::var("PRICE_ACTION_KRAKEN_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let secret = env::var("PRICE_ACTION_KRAKEN_PRIVATE_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    match (api_key, secret) {
+        (None, None) => Err(Error::Config(
+            "neither PRICE_ACTION_KRAKEN_API_KEY nor PRICE_ACTION_KRAKEN_PRIVATE_KEY is set; \
+             inject both from your secret manager (e.g. \
+             `op run --env-file=.env.tpl -- price-action kraken check-keys`) — \
+             see docs/kraken-market-data.md"
+                .to_owned(),
+        )),
+        (Some(_), None) => Err(Error::Config(
+            "PRICE_ACTION_KRAKEN_API_KEY is set but PRICE_ACTION_KRAKEN_PRIVATE_KEY is not — \
+             the pair must be injected together"
+                .to_owned(),
+        )),
+        (None, Some(_)) => Err(Error::Config(
+            "PRICE_ACTION_KRAKEN_PRIVATE_KEY is set but PRICE_ACTION_KRAKEN_API_KEY is not — \
+             the pair must be injected together"
+                .to_owned(),
+        )),
+        (Some(api_key), Some(secret)) => {
+            feed::install_crypto_provider()?;
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| Error::Execution(format!("cannot start the async runtime: {e}")))?;
+            let summary = runtime.block_on(kraken::authenticated_check(&api_key, &secret))?;
+            println!("kraken read-only key check OK: {summary}");
+            println!("no order was sent — this binary is paper-only in every mode");
+            Ok(())
+        }
+    }
+}
 
 /// `kraken backtest` — fetches recent **committed** candles for one crypto
 /// pair from Kraken's public REST endpoint and drives them through the same
@@ -226,8 +289,49 @@ fn parse_kraken_backtest_args(rest: &[String]) -> Result<(Option<String>, Option
 /// token and chat id are both configured, delivered there too; a failed
 /// delivery is logged and the session keeps trading.
 ///
+/// The optional read-only Kraken key check that runs before a Kraken live
+/// session starts.
+///
+/// The public OHLC stream needs no key, but an operator may inject the
+/// optional read-only pair (`PRICE_ACTION_KRAKEN_API_KEY` +
+/// `PRICE_ACTION_KRAKEN_PRIVATE_KEY`, see `docs/kraken-market-data.md`) to
+/// prove the credentials work before the session runs for hours. Half a pair
+/// is a configuration error; a full pair that fails the check warns and
+/// continues — the stream itself is public and unkeyed, and no code path here
+/// ever sends an order either way (paper-only, see the module doc).
+fn verify_kraken_keys_if_configured(
+    config: &Config,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), Error> {
+    match (&config.kraken_api_key, &config.kraken_private_key) {
+        (Some(api_key), Some(secret)) => {
+            match runtime.block_on(kraken::authenticated_check(api_key, secret)) {
+                Ok(summary) => {
+                    eprintln!("price-action: kraken read-only key check OK: {summary}");
+                }
+                Err(e) => eprintln!(
+                    "price-action: WARNING kraken read-only key check failed ({e}); \
+                     continuing on public market data only"
+                ),
+            }
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Error::Config(
+                "PRICE_ACTION_KRAKEN_API_KEY and PRICE_ACTION_KRAKEN_PRIVATE_KEY \
+                 must be set together (or not at all)"
+                    .to_owned(),
+            ));
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
 /// Runs until Ctrl-C (or the feeder's channel closing), then prints the
 /// session report and says where the bars were persisted for re-replay.
+///
+/// The optional read-only Kraken key pair is verified first — see
+/// [`verify_kraken_keys_if_configured`].
 fn run_live() -> Result<(), Error> {
     let mut config = Config::load_for_live()?;
     // rustls needs a process-level crypto provider before the first TLS use;
@@ -265,6 +369,7 @@ fn run_live() -> Result<(), Error> {
             (Some(settings), None)
         }
         FeedSource::Kraken => {
+            verify_kraken_keys_if_configured(&config, &runtime)?;
             let resolution = runtime.block_on(kraken::resolve_pair(&config.symbol))?;
             let interval_secs: u32 = u32::try_from(config.bar_interval_secs).map_err(|_| {
                 // Cannot fail after `load_for_live`'s interval validation, so
@@ -415,7 +520,7 @@ mod tests {
     #[test]
     fn usage_line_documents_all_subcommand_shapes() {
         assert!(USAGE.starts_with(
-            "usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | live>"
+            "usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | kraken check-keys | live>"
         ));
         assert!(USAGE.contains("samples/sample-bars.csv"));
     }
