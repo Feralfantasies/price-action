@@ -54,12 +54,16 @@ cd price-action
 cargo run
 # price-action: symbol=AAPL mode=Paper quantity=1 bar_interval=60s threshold=3
 # price-action: engine ready, last signal = Flat (this path consumes no market data)
-# hint: `price-action replay samples/sample-bars.csv` for historic bars, or `price-action live` to stream real-time bars (paper execution either way)
+# hint: `price-action replay samples/sample-bars.csv` for historic bars, `price-action kraken backtest --pair BTC/USD` for recent real crypto candles, or `price-action live` to stream real-time bars (paper execution either way)
 ```
 
-The binary has two subcommands: `replay <bars.csv>` (offline, step 1) and
-`live` (streaming, still paper execution). Anything else is rejected with
-`usage: price-action <replay <bars.csv> | live>` and exit code 1.
+The binary's subcommands: `replay <bars.csv>` (offline, step 1),
+`kraken backtest` (recent **real** Kraken candles through the same paper
+account, step 4), `kraken check-keys` (optional read-only API-key
+verification) and `live` (streaming, still paper execution). Anything else is
+rejected with
+`usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | kraken check-keys | live>`
+and exit code 1.
 
 ### 2. Replay the bundled sample data
 
@@ -262,6 +266,21 @@ Then run it:
 cargo run -- replay aapl-daily.csv
 ```
 
+For crypto pairs there is a built-in shortcut: `kraken backtest` fetches
+recent **committed** candles straight from Kraken's public REST API (no key,
+no CSV wrangling) and runs them through the exact same paper account:
+
+```sh
+cargo run -- kraken backtest --pair XBT/USD --interval 300   # 5-minute candles
+cargo run -- kraken backtest                                 # configured symbol, 300s
+```
+
+`--pair` accepts Kraken spellings (`XBT/USD`, `BTC/USD`, `XBTUSD`) and
+defaults to the configured `symbol`; `--interval` defaults to 300 s and must
+name one of Kraken's candle intervals (60/300/900/1800/3600/14400/86400).
+The report has the same shape as replay's, labelled `price-action kraken`.
+See [Kraken Market Data](docs/kraken-market-data.md).
+
 Good hygiene when validating settings this way:
 
 - Use a dataset that *contains both* conditions you care about (trending and
@@ -323,6 +342,7 @@ while `docs/` covers behaviour, formats, and rules.
 | [Overview](docs/overview.md) | Architecture pipeline, current scope (paper-only), module map |
 | [Replay Workflow](docs/replay-workflow.md) | Verifying settings against historic bars; guarantees; A/B loops |
 | [Live Market-Data Session](docs/live-market-data-session.md) | The `live` subcommand: Massive.com and Kraken v2 WebSocket sources, `live_feed_source`, bar shaping, gap notes, mock-trade log, daily summaries, persisted CSV |
+| [Kraken Market Data & Keys](docs/kraken-market-data.md) | Kraken public REST candles (`kraken backtest`), the public WebSocket source, and the optional read-only API-key pair (`kraken check-keys`): rules, 1Password injection, failure modes |
 | [Trading Engine](docs/engine.md) | The bar → signal → position loop and its retry invariant |
 | [Consecutive Closes Strategy](docs/strategy-consecutive-closes.md) | The only shipping strategy: rule, state machine, tuning |
 | [Market Data Model](docs/market-data-model.md) | `Bar` (validated OHLCV) and the `BarSeries` rolling window |
@@ -370,6 +390,8 @@ override the config file, which overrides compiled defaults**:
 | Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` |
 | Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` |
 | Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ |
+| Kraken API key *(env-only)* | `PRICE_ACTION_KRAKEN_API_KEY` | — *(rejected in file)* | _(unset)_ |
+| Kraken private key *(env-only)* | `PRICE_ACTION_KRAKEN_PRIVATE_KEY` | — *(rejected in file)* | _(unset)_ |
 | Live session CSV dir | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` |
 | Telegram bot token | `PRICE_ACTION_TELEGRAM_BOT_TOKEN` | `telegram_bot_token` | _(unset)_ |
 | Telegram chat id | `PRICE_ACTION_TELEGRAM_CHAT_ID` | `telegram_chat_id` | _(unset)_ |
@@ -381,8 +403,14 @@ Unknown config-file keys are rejected (typos fail fast). `live` **mode**
 its source is Massive; the Kraken source is public and needs no key at all. An empty
 variable is treated as unset. Prefer the environment or a mounted secret for
 `broker_api_key`, `massive_api_key` and `telegram_bot_token` rather than
-committing them to a file — all three are redacted in any `Config` debug
-output.
+committing them to a file — all of them are redacted in any `Config` debug
+output. The optional Kraken read-only pair (`PRICE_ACTION_KRAKEN_API_KEY` +
+`PRICE_ACTION_KRAKEN_PRIVATE_KEY`) is **environment-only** — a config file
+carrying either half is rejected — and must be set **together**; it is used
+for at most one signed read-only balance check (`kraken check-keys`, or at
+`live` startup with the Kraken source), never to place an order, and both
+halves are redacted too. See
+[Kraken Market Data](docs/kraken-market-data.md).
 
 `PRICE_ACTION_SYMBOL`, `MODE` and `BAR_INTERVAL_SECS` are cosmetic during
 replay (there are no orders). The remaining three all change what you see:

@@ -14,7 +14,7 @@ sources:
   - id: mainrs
     resource: /src/main.rs
     title: kraken backtest / kraken check-keys subcommands, live-session wiring
-generated: { by: pi-agent/qwen3.8-max, at: 2026-10-13T00:00:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
 ---
 
 # Kraken Market Data & Optional Read-Only Keys
@@ -27,6 +27,28 @@ All Kraken **market data** this binary consumes is public and keyless:
   public Spot WebSocket v2 (`wss://ws.kraken.com`).[^krakenrs]
 
 Neither path reads, needs or accepts an API key.[^mainrs]
+
+# `kraken backtest`
+
+```console
+$ price-action kraken backtest --pair XBT/USD --interval 300
+```
+
+* `--pair` (optional) — any Kraken spelling (`XBT/USD`, `BTC/USD`, `XBTUSD`,
+  …); resolved against Kraken's public `AssetPairs`/`Assets` tables so the run
+  trades and reports under the resolved **display** form. Defaults to the
+  configured `symbol`.
+* `--interval` (optional) — candle length in seconds; must name one of
+  Kraken's intervals (60/300/900/1800/3600/14400/86400). Defaults to 300.
+  Rejected with a config error otherwise.
+* Fetches `0/public/OHLC`, **drops the trailing in-progress candle** (only
+  committed candles are traded), and feeds the rest through the exact same
+  `ReplaySession`/paper account as file replay — the report is the replay
+  report shape under the source label `price-action kraken`.
+* Transport: hand-rolled HTTP/1.1 GET over rustls (no HTTP-client crate,
+  matching the repository rule), 30 s request timeout, chunked bodies
+  reassembled before JSON decoding; Kraken business-error arrays surface as
+  `MarketData` errors naming the endpoint.
 
 # The optional key pair
 

@@ -62,6 +62,14 @@ max_leverage = 1
 #               candles at bar_interval_secs (1m/5m/15m/30m/1h/1d).
 live_feed_source = "massive"
 
+# Optional READ-ONLY Kraken API-key pair — environment-only ON PURPOSE:
+# this file rejects both keys (a key committed here is a key leaked). Inject
+# them from a secret manager instead, e.g.
+#   op run --env-file=.env.tpl -- price-action kraken check-keys
+# (PRICE_ACTION_KRAKEN_API_KEY + PRICE_ACTION_KRAKEN_PRIVATE_KEY, both or
+# neither). Used for one signed read-only balance check — never to place an
+# order. See docs/kraken-market-data.md.
+
 # Massive.com socket host: a BARE hostname (no scheme, path or whitespace).
 # `live` builds wss://<host>/stocks from it.
 #   socket.massive.com   real-time

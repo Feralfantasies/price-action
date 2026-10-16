@@ -466,7 +466,7 @@ fn run_live() -> Result<(), Error> {
 /// No subcommand: the readiness check. Live *execution* is not implemented,
 /// and this path consumes no market data, so the branch verifies configuration
 /// loads (fully, including execution rules for a live run) and reports
-/// readiness, pointing at the two subcommands that do take data.
+/// readiness, pointing at the three subcommands that do take data.
 fn run_no_args() -> Result<(), Error> {
     let config = Config::load()?;
 

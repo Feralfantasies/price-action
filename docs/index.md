@@ -7,9 +7,11 @@ okf_version: "0.2"
 Open Knowledge Format ([OKF v0.2](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md))
 bundle documenting the `price-action` repository: a Rust trading engine whose
 strategies are driven by raw price movement (OHLCV bars) rather than derived
-indicators. Two ways to feed it bars: a **replay** mode that validates settings
-against historic data, and a **live** mode that streams real-time data from the
-Massive.com stocks WebSocket. Both price every decision as a funded paper
+indicators. Three ways to feed it bars: a **replay** mode that validates
+settings against historic data, a **kraken backtest** mode that fetches recent
+real candles from Kraken's public REST API, and a **live** mode that streams
+real-time data from the Massive.com stocks WebSocket or Kraken's public Spot
+WebSocket v2. All price every decision as a funded paper
 account (fees, realized P/L per trade, per-UTC-day and session totals), and a
 live session additionally summarizes each closed UTC day — optionally delivered
 to Telegram. **Execution is paper-only in both modes: no order is ever placed.**
@@ -22,7 +24,8 @@ change and MUST keep it current when behaviour changes** — see
 
 * [Overview](overview.md) — What the project is, its architecture pipeline, its scope (and explicit non-goals: no live *execution*, ever, so far).
 * [Replay Workflow](replay-workflow.md) — The sanctioned workflow for verifying settings against historic bars. Replay is read-only by design; its report now includes funded paper-accounting roll-ups.
-* [Live Market-Data Session](live-market-data-session.md) — The `live` subcommand: streaming real-time bars from the Massive.com WebSocket and paper-trading them against a fake balance, through the very same pipeline replay uses.
+* [Live Market-Data Session](live-market-data-session.md) — The `live` subcommand: streaming real-time bars from the Massive.com or Kraken WebSocket and paper-trading them against a fake balance, through the very same pipeline replay uses.
+* [Kraken Market Data & Keys](kraken-market-data.md) — Kraken's public data paths (`kraken backtest` REST candles, the `live` WebSocket source) and the strictly optional, environment-injected read-only API-key pair (`kraken check-keys`).
 
 # Architecture Concepts
 

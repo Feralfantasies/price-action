@@ -11,7 +11,7 @@ sources:
   - id: example-toml
     resource: /price-action.example.toml
     title: Example TOML config file
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T14:22:52Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
 ---
 
 Trading options resolve in strict precedence order — **environment variables
@@ -44,6 +44,8 @@ override the config file, which overrides compiled defaults**.[^config-src]
 | Live feed host | `PRICE_ACTION_LIVE_FEED_HOST` | `live_feed_host` | `socket.massive.com` | Bare hostname, **no scheme, path, userinfo (`@`) or whitespace**: `live` builds `wss://<host>/stocks` from it. Use `delayed.massive.com` for the 15-minute-delayed feed. Rejected when empty or when it contains whitespace or `/ : @ \`. Live-session only. See [Live Market-Data Session](live-market-data-session.md). |
 | Live feed channel | `PRICE_ACTION_LIVE_FEED_CHANNEL` | `live_feed_channel` | `minute` | `"minute"` (per-minute OHLCV windows, `AM.<SYM>`) or `"ticks"` (tick trades, `T.<SYM>`, aggregated into per-second bars). Case-insensitive and trimmed; any other value is rejected naming `live_feed_channel`. Live-session only. |
 | Massive.com API key | `PRICE_ACTION_MASSIVE_API_KEY` | `massive_api_key` | _(unset)_ | **Secret.** Required by the `live` subcommand **when the source is Massive** (that feed is authenticated); never needed for replay, the no-args path, or a Kraken live session — that endpoint is public and no key is read for it. Prefer the env var or a mounted secret over committing it to a file. Redacted in all debug output of `Config`. |
+| Kraken API key | `PRICE_ACTION_KRAKEN_API_KEY` | — *(rejected in the config file)* | _(unset)_ | **Secret, environment-only.** Optional; pairs with `kraken_private_key` (**both or neither**). Used for at most one signed **read-only** `GET /0/private/Balance` check — `kraken check-keys`, or at `live` startup when the source is Kraken (success prints a masked OK line, failure warns and continues on public data). No order path exists in this crate. Masked (first six characters + `…`) in all output, redacted in `Config`'s `Debug`. See [Kraken Market Data & Keys](kraken-market-data.md). |
+| Kraken private key | `PRICE_ACTION_KRAKEN_PRIVATE_KEY` | — *(rejected in the config file)* | _(unset)_ | **Secret, environment-only.** The base64 secret that pairs with `kraken_api_key`; it signs the read-only check request (HMAC-SHA512). Same both-or-neither, redaction and never-in-a-file rules; a secret that is not standard base64 is rejected as a config error **before any network call**. |
 | Live session CSV directory | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` | Where `live` persists each session's bars as a replay-compatible CSV (`live-<SYMBOL>-<UTC stamp>.csv`, created if absent). Must not be empty. Nothing is written when a session saw no bars. |
 | Telegram bot token | `PRICE_ACTION_TELEGRAM_BOT_TOKEN` | `telegram_bot_token` | _(unset)_ | **Secret.** Optional. Redacted in all debug output of `Config`. See the both-or-neither rule below and [Telegram Notifications](telegram-notifications.md). |
 | Telegram chat id | `PRICE_ACTION_TELEGRAM_CHAT_ID` | `telegram_chat_id` | _(unset)_ | Optional; may be negative for a group or channel. Not a credential (it is shown in `Debug` and in delivery log lines). Must be paired with the token. |
@@ -56,10 +58,15 @@ Semantics worth pinning down:
   (they may belong to other tooling sharing the process).
 - Unparseable env values (e.g. `PRICE_ACTION_QUANTITY=lots`) error naming the
   exact variable.
-- **`Config`'s `Debug` impl redacts all three credentials** —
-  `broker_api_key`, `massive_api_key` and `telegram_bot_token` each render as
+- **`Config`'s `Debug` impl redacts all five credentials** —
+  `broker_api_key`, `massive_api_key`, `telegram_bot_token` and the
+  environment-only `kraken_api_key` / `kraken_private_key` pair each render as
   `[redacted]` when present — so formatting a config in logs or test output can
   never leak one; all other fields remain visible for diagnostics.[^config-src]
+- **The Kraken pair is both-or-neither and environment-only.** `FileConfig`
+  rejects `kraken_api_key` / `kraken_private_key` outright (a committed key is
+  a leaked key); exactly one half set is a config error naming the missing
+  variable. See [Kraken Market Data & Keys](kraken-market-data.md).[^config-src]
 - **Telegram delivery is both-or-neither.** With neither key set, daily
   summaries go to the console only — a supported configuration, not an error.
   With exactly one set, `live` fails fast naming the *missing* half (and never

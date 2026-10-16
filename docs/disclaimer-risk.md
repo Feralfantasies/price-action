@@ -8,7 +8,7 @@ sources:
   - id: disclaimer-md
     resource: /DISCLAIMER.md
     title: Full disclaimer document (governing text)
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
 ---
 
 **This software is for educational and research purposes only and is not
@@ -39,6 +39,18 @@ docs, READMEs, or commits they change. Summary:
   have done at the configured fee rate, with no slippage, no partial fills, no
   venue minimums and no queue — they are **not** a track record, not evidence of
   prospective performance, and not a claim that the strategy works.
+- **Leveraged numbers are an approximation.** A run with `max_leverage > 1`
+  prices fees and P/L on the leveraged notional at the flat per-side bps rate
+  and force-liquidates at a bar close when marked equity can no longer support
+  the required margin — an approximation of Kraken's tiered fee schedule and
+  maintenance-margin rules, not a model of them: no intra-bar liquidation, no
+  funding rates, no tiered fees. See
+  [Paper Trading Accounting](paper-trading-accounting.md).
+- **Even the optional Kraken key pair can only read.** The one private call in
+  the codebase is a single signed `GET /0/private/Balance` used to verify
+  credentials (`kraken check-keys`, or at Kraken-source `live` startup); there
+  is no order path for any key to reach. See
+  [Kraken Market Data & Keys](kraken-market-data.md).
 - **Data holes are reported, not hidden.** A live session annotates bars that
   follow missing windows/ticks or a feed interruption, because a gap can change
   what the strategy decided. Read those annotations before drawing any
