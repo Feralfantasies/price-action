@@ -651,8 +651,14 @@ mod tests {
         let report = replay_bars(&config, &bars).expect("replay");
         assert_eq!(report.entries, 1); // raw-signal entry still counted
         assert_eq!(report.skipped_entries, 1);
-        assert!(report.closed_trades.is_empty());
-        assert!(report.per_day_totals.is_empty());
+        assert!(
+            report.closed_trades.is_empty(),
+            "the skipped entry never opened, so nothing closed"
+        );
+        assert!(
+            report.per_day_totals.is_empty(),
+            "no funded entry means no day rows"
+        );
         assert!((report.session_totals.final_equity - 1.0).abs() < 1e-9); // never touched
 
         let mut buf = Vec::new();
@@ -725,7 +731,10 @@ mod tests {
         assert_eq!(batch.per_day_totals, streamed.per_day_totals);
 
         // The session also produced a closed trade worth logging live.
-        assert!(!streamed.closed_trades.is_empty());
+        assert!(
+            !streamed.closed_trades.is_empty(),
+            "the session closed a trade worth logging"
+        );
     }
 
     #[test]

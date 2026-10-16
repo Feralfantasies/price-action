@@ -667,7 +667,7 @@ mod tests {
         assert!(out.entry_skipped); // needs 30 + fee > 10
         assert_eq!(out.effective_signal, S::Flat);
         near(out.state.available, 10.0);
-        assert!(acc.closed_trades().is_empty());
+        assert!(acc.closed_trades().is_empty(), "nothing closed yet");
 
         let out = acc.on_bar(&S::Short, 1, &bar(9.0, D_BASE + 900)); // affordable now
         assert!(!out.entry_skipped);
@@ -825,7 +825,10 @@ mod tests {
         assert_eq!(out_flat.effective_signal, S::Long); // still open at 1x
         assert!(!out_flat.liquidated);
         near(out_flat.state.equity, 900.0);
-        assert!(flat.closed_trades().is_empty());
+        assert!(
+            flat.closed_trades().is_empty(),
+            "the 1x position never liquidated, so nothing closed"
+        );
 
         let out = levered.on_bar(&S::Long, 1, &bar(9.0, D_BASE + 900));
         assert!(out.liquidated);

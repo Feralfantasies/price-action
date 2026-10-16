@@ -1461,7 +1461,10 @@ mod tests {
         let (output, summaries) = run_collecting(&config, rx, std::future::pending::<()>()).await;
         assert_eq!(output.report.bars, 0);
         assert!(output.csv_path.is_none(), "nothing to persist");
-        assert!(output.report.trace_lines.is_empty());
+        assert!(
+            output.report.trace_lines.is_empty(),
+            "no bars means no trace lines"
+        );
         assert!(summaries.is_empty(), "no bars means no day to summarize");
     }
 
