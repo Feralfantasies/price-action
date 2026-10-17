@@ -72,9 +72,15 @@ is rebuilt by re-replaying them rather than stored.
   **skipped** — the trace still prints the raw strategy signal with an
   `(insufficient funds)` note and no position opens. A skipped reversal leaves
   the old leg already exited at the same close, recorded as a closed trade.
-- **Equity mark:** after every bar, `equity = free funds + open position
-  marked at that bar's close` — shares valued at the close for longs,
-  collateral plus unrealized (entry − close) × quantity for shorts. While
+- **Equity mark:** after every bar, `equity = free funds + required margin +
+  leveraged unrealized P/L at that bar's close`, the required margin being the
+  capital committed at entry (`quantity × entry`):
+  - long: `free + quantity × entry + (close − entry) × quantity × max_leverage`
+  - short: `free + quantity × entry + (entry − close) × quantity × max_leverage`
+
+  At `max_leverage = 1` these reduce exactly to the historical marks — shares
+  valued at the close (`quantity × close`) for longs, and collateral plus
+  unrealized `(entry − close) × quantity` for shorts. While
   flat, equity equals free funds; the session total marks its final bar at
   the file's last close. Per the insolvency policy below this value floors
   at 0.

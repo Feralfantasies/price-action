@@ -291,14 +291,9 @@ pub fn render_report(
         "paper account: starting_balance={:.2} trade_fee_bps={} (per side, on the notional)",
         config.starting_balance, config.trade_fee_bps,
     )?;
-    writeln!(out, "{sep}")?;
-    for line in &report.trace_lines {
-        writeln!(out, "{line}")?;
-    }
-    writeln!(out, "{sep}")?;
-
-    // A leveraged run says so on its own header line: the 1x header stays
-    // byte-identical to what README.md and docs/replay-workflow.md pin.
+    // A leveraged run says so on its own header line, above the trace: the 1x
+    // output stays byte-identical to what README.md and
+    // docs/replay-workflow.md pin.
     if config.max_leverage > 1 {
         writeln!(
             out,

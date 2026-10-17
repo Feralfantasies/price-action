@@ -849,11 +849,17 @@ fn merge_notes(interrupt: Option<String>, jump: Option<String>) -> Option<String
 /// that would have been put down, the fees it would have paid and the account
 /// state afterwards. A trade the simulation had to force closed because the
 /// leveraged position outgrew its maintenance margin carries a
-/// `[liquidated]` marker, so a leveraged session's log reads honestly about
-/// why the trade ended.
+/// `[liquidated]` marker, and a leveraged session marks its size as
+/// `x<quantity> @<leverage>x` so its lines are distinguishable from 1x — the
+/// 1x line keeps the historical, documented shape byte-for-byte.
 fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, state: BarState) {
+    let leverage_note = if config.max_leverage > 1 {
+        format!(" @{}x", config.max_leverage)
+    } else {
+        String::new()
+    };
     println!(
-        "[{}] MOCK TRADE #{}{} {} {} x{} entry={} ({}) -> exit={} ({}) | \
+        "[{}] MOCK TRADE #{}{} {} {} x{}{} entry={} ({}) -> exit={} ({}) | \
          committed={:.2} fees={:.4} ({} bps/side) gross P/L={:+.2} net P/L={:+.2} | \
          cash={:.2} equity={:.2}",
         utc_stamp(bar_ts),
@@ -866,6 +872,7 @@ fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, stat
         if trade.side_is_long { "LONG " } else { "SHORT" },
         config.symbol,
         config.quantity,
+        leverage_note,
         trade.entry_price,
         trade.entry_day,
         trade.exit_price,
