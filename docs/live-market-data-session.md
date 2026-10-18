@@ -92,7 +92,7 @@ starts, so a mistake fails before any connection:
 - `live_feed_channel` must be `"minute"` — Kraken's v2 OHLC channel streams
   candles, there is no tick channel here; `ticks` is rejected naming the setting.
 - `bar_interval_secs` must name one of Kraken's own candle intervals
-  (`60`, `300`, `900`, `1800`, `3600`, `86400`); anything else is rejected
+  (`60`, `300`, `900`, `1800`, `3600`, `14400`); anything else is rejected
   naming `bar_interval_secs`.
 
 The pair is resolved to Kraken's **display** form before the banner prints
@@ -108,8 +108,10 @@ PRICE_ACTION_BAR_INTERVAL_SECS=60 \
 ```
 
 Configuration is loaded through `Config::load_for_live()`: full `Config::load`
-validation **plus** a resolvable market-data API key. Replay and the no-args
-path are unaffected by the live-only keys.[^configsrc]
+validation **plus** the source-specific market-data rules — a resolvable
+`massive_api_key` for the authenticated Massive feed, or the Kraken
+channel/interval rules (no key at all; that feed is public). Replay and the
+no-args path are unaffected by the live-only keys.[^configsrc]
 
 ## What comes off the wire
 

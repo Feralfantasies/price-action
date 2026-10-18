@@ -277,12 +277,21 @@ impl Config {
     }
 
     /// Loads configuration for the `live` subcommand: everything
-    /// [`Config::load`] enforces, **plus** a resolvable market-data API key
-    /// (the feed is authenticated; data-only — no execution involved yet).
+    /// [`Config::load`] enforces, **plus** the source-specific market-data
+    /// rules (`validate_live_market_data`) for the configured
+    /// `live_feed_source`: the authenticated **Massive** feed requires a
+    /// resolvable `massive_api_key`; the **Kraken** feed is public (no key
+    /// exists or is read) and instead requires `live_feed_channel = "minute"`
+    /// and a `bar_interval_secs` naming one of Kraken's candle intervals.
+    /// Data-only — no execution involved yet.
     ///
     /// # Errors
     ///
-    /// Same as [`Config::load`], rejecting an absent/blank `massive_api_key`.
+    /// Same as [`Config::load`], plus: with the Massive source, an
+    /// absent/blank `massive_api_key` is rejected naming it; with the Kraken
+    /// source, a `live_feed_channel` other than `minute` or a
+    /// `bar_interval_secs` outside Kraken's intervals is rejected naming the
+    /// setting.
     pub fn load_for_live() -> Result<Self, ConfigError> {
         let env = |var: &str| std::env::var(var).ok().filter(|v| !v.is_empty());
         let path = env(CONFIG_PATH_VAR).unwrap_or_else(|| DEFAULT_CONFIG_PATH.to_string());

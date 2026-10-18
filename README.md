@@ -181,7 +181,7 @@ window in flight is held until the next one starts, so it carries its *final*
 numbers) and `ticks` (aggregated locally into per-second bars). The Kraken
 source has one endpoint (`wss://ws.kraken.com/v2`), one channel (`minute`) and
 its bar length is `bar_interval_secs` — one of Kraken's own candle intervals
-(1m, 5m, 15m, 30m, 1h, 1d).
+(1m, 5m, 15m, 30m, 1h, 4h).
 
 Add Telegram delivery of the daily summaries by setting **both** keys (with
 neither, summaries print to the console only; with exactly one, `live` fails
@@ -277,7 +277,7 @@ cargo run -- kraken backtest                                 # configured symbol
 
 `--pair` accepts Kraken spellings (`XBT/USD`, `BTC/USD`, `XBTUSD`) and
 defaults to the configured `symbol`; `--interval` defaults to 300 s and must
-name one of Kraken's candle intervals (60/300/900/1800/3600/14400/86400).
+name one of Kraken's candle intervals (60/300/900/1800/3600/14400).
 The report has the same shape as replay's, labelled `price-action kraken`.
 See [Kraken Market Data](docs/kraken-market-data.md).
 

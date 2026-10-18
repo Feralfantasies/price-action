@@ -59,7 +59,7 @@ max_leverage = 1
 #               needs massive_api_key below)
 #   "kraken"  — Kraken Spot WebSocket v2 `ohlc` channel: PUBLIC, no key exists
 #               for it and none is read. Minute channel only; bars are Kraken's
-#               candles at bar_interval_secs (1m/5m/15m/30m/1h/1d).
+#               candles at bar_interval_secs (1m/5m/15m/30m/1h/4h).
 live_feed_source = "massive"
 
 # Optional READ-ONLY Kraken API-key pair — environment-only ON PURPOSE:

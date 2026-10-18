@@ -39,7 +39,7 @@ $ price-action kraken backtest --pair XBT/USD --interval 300
   trades and reports under the resolved **display** form. Defaults to the
   configured `symbol`.
 * `--interval` (optional) — candle length in seconds; must name one of
-  Kraken's intervals (60/300/900/1800/3600/14400/86400). Defaults to 300.
+  Kraken's intervals (60/300/900/1800/3600/14400). Defaults to 300.
   Rejected with a config error otherwise.
 * Fetches `0/public/OHLC`, **drops the trailing in-progress candle** (only
   committed candles are traded), and feeds the rest through the exact same
