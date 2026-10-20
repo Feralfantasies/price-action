@@ -166,6 +166,11 @@ What you get:
   entries, exits, fees paid, realized P/L net of fees, ending cash/equity and
   any position still open. A quiet day still reports (zero activity, unchanged
   balance).
+- **Periodic status snapshots** (opt-in): with `PRICE_ACTION_STATUS_INTERVAL_SECS`
+  set (e.g. `900` for 15 minutes), one `PAPER STATUS` line prints per interval —
+  bars so far, last close, signal, open position, closed trades and realized
+  P/L, cash/equity — so `kubectl logs` answers "how is it doing?" without
+  waiting for midnight. Default `0` prints none.
 - **The full session report** on stop: the same per-bar trace, closed-trade
   table, per-UTC-day totals and session totals replay prints, with `live` as
   the source label.
@@ -393,6 +398,7 @@ override the config file, which overrides compiled defaults**:
 | Kraken API key *(env-only)* | `PRICE_ACTION_KRAKEN_API_KEY` | — *(rejected in file)* | _(unset)_ |
 | Kraken private key *(env-only)* | `PRICE_ACTION_KRAKEN_PRIVATE_KEY` | — *(rejected in file)* | _(unset)_ |
 | Live session CSV dir | `PRICE_ACTION_LIVE_CSV_DIR` | `live_csv_dir` | `./sessions` |
+| Live status interval | `PRICE_ACTION_STATUS_INTERVAL_SECS` | `status_interval_secs` | `0` (off) |
 | Telegram bot token | `PRICE_ACTION_TELEGRAM_BOT_TOKEN` | `telegram_bot_token` | _(unset)_ |
 | Telegram chat id | `PRICE_ACTION_TELEGRAM_CHAT_ID` | `telegram_chat_id` | _(unset)_ |
 | Config-file path | `PRICE_ACTION_CONFIG` | — | `price-action.toml` |

@@ -146,6 +146,16 @@ pub struct BarOutcome {
     pub liquidated: bool,
 }
 
+/// What the live session's periodic `STATUS` line shows about the open
+/// position — the side and the entry price, nothing else.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionSnapshot {
+    /// True when the open position is long (false = short).
+    pub is_long: bool,
+    /// Close price the position entered at.
+    pub entry_price: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Side {
     Long,
@@ -247,6 +257,16 @@ impl PaperAccount {
     #[must_use]
     pub fn closed_trades(&self) -> &[ClosedTrade] {
         &self.closed_trades
+    }
+
+    /// Snapshot of the currently open position, if any; `None` while flat.
+    /// Feeds the live session's periodic `STATUS` line.
+    #[must_use]
+    pub fn position_snapshot(&self) -> Option<PositionSnapshot> {
+        self.open_side.map(|side| PositionSnapshot {
+            is_long: matches!(side, Side::Long),
+            entry_price: self.entry_price,
+        })
     }
 
     fn held_signal(&self) -> Signal {

@@ -110,6 +110,14 @@ pub struct Config {
     pub mode: Mode,
     /// Bar interval in seconds. Must be at least 1.
     pub bar_interval_secs: u64,
+    /// Live-session only: minimum seconds between periodic `PAPER STATUS`
+    /// snapshot lines on stdout (bar count, last close, raw signal, open
+    /// position, closed-trade roll-up, cash/equity — all simulated-account
+    /// figures). `0` — the default — prints none, exactly the historical
+    /// behaviour. Values below the bar cadence effectively print one line
+    /// per bar. Only `live` emits these lines; replay and the no-args path
+    /// load the value like any other setting but never print one.
+    pub status_interval_secs: u64,
     /// Number of recent bars retained in the rolling window.
     pub series_capacity: usize,
     /// Consecutive higher/lower closes before the example strategy signals.
@@ -209,6 +217,7 @@ impl Default for Config {
             quantity: 1,
             mode: Mode::default(),
             bar_interval_secs: 60,
+            status_interval_secs: 0,
             series_capacity: 500,
             consecutive_closes_threshold: 3,
             starting_balance: 10_000.0,
@@ -238,6 +247,7 @@ struct FileConfig {
     quantity: Option<u32>,
     mode: Option<String>,
     bar_interval_secs: Option<u64>,
+    status_interval_secs: Option<u64>,
     series_capacity: Option<usize>,
     consecutive_closes_threshold: Option<u32>,
     starting_balance: Option<f64>,
@@ -379,6 +389,9 @@ impl Config {
         if let Some(v) = file.bar_interval_secs {
             self.bar_interval_secs = v;
         }
+        if let Some(v) = file.status_interval_secs {
+            self.status_interval_secs = v;
+        }
         if let Some(v) = file.series_capacity {
             self.series_capacity = v;
         }
@@ -430,6 +443,7 @@ impl Config {
         env_override(env, "SYMBOL", &mut self.symbol)?;
         env_override(env, "QUANTITY", &mut self.quantity)?;
         env_override(env, "BAR_INTERVAL_SECS", &mut self.bar_interval_secs)?;
+        env_override(env, "STATUS_INTERVAL_SECS", &mut self.status_interval_secs)?;
         env_override(env, "SERIES_CAPACITY", &mut self.series_capacity)?;
         env_override(
             env,
@@ -658,6 +672,7 @@ impl fmt::Debug for Config {
                 &self.kraken_private_key.as_ref().map(|_| "[redacted]"),
             )
             .field("live_csv_dir", &self.live_csv_dir)
+            .field("status_interval_secs", &self.status_interval_secs)
             .field(
                 "telegram_bot_token",
                 &self.telegram_bot_token.as_ref().map(|_| "[redacted]"),
@@ -771,6 +786,27 @@ mod tests {
         let cfg = Config::load_from(&no_file(), &env_from(BTreeMap::new())).unwrap();
         assert_eq!(cfg, Config::default());
         assert_eq!(cfg.mode, Mode::Paper);
+    }
+
+    #[test]
+    fn status_interval_parses_from_env_and_file() {
+        let cfg = Config::load_from(
+            &no_file(),
+            &env_from(BTreeMap::from([(
+                "PRICE_ACTION_STATUS_INTERVAL_SECS",
+                "900",
+            )])),
+        )
+        .unwrap();
+        assert_eq!(cfg.status_interval_secs, 900);
+
+        let path = write_temp_config("status_interval_secs = 300\n");
+        let cfg = Config::load_from(&path, &env_from(BTreeMap::new())).unwrap();
+        assert_eq!(cfg.status_interval_secs, 300);
+        let _ = std::fs::remove_file(&path); // leave no test artifact behind
+
+        // The default is off: no STATUS lines unless asked for.
+        assert_eq!(Config::default().status_interval_secs, 0);
     }
 
     #[test]

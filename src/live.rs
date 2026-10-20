@@ -32,7 +32,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::{
-    accounting::{utc_day, BarState, ClosedTrade},
+    accounting::{utc_day, BarState, ClosedTrade, PositionSnapshot},
     config::Config,
     csv,
     error::Error,
@@ -620,6 +620,9 @@ struct SessionState {
     last_close: Option<f64>,
     /// A feed interruption is only honest once there is a bar to attach it to.
     pending_gap_note: Option<String>,
+    /// Bar timestamp of the last periodic `PAPER STATUS` line; `None` until
+    /// the first one prints (the session's first bar always prints one).
+    last_status: Option<SystemTime>,
     /// Running totals for the UTC day in progress.
     day: DayAccumulator,
 }
@@ -637,6 +640,7 @@ impl SessionState {
             bars: Vec::new(),
             last_close: None,
             pending_gap_note: None,
+            last_status: None,
             day: DayAccumulator::new(config.starting_balance),
         }
     }
@@ -673,6 +677,30 @@ impl SessionState {
 
         for trade in &result.closed_trades {
             log_mock_trade(trade, bar.timestamp(), config, result.outcome.state);
+        }
+
+        // Periodic PAPER STATUS snapshot (opt-in via `status_interval_secs`):
+        // the mid-session answer to "how is it doing?" between daily
+        // summaries. Gated on bar timestamps — session time, not wall clock —
+        // so a stalled feed prints nothing stale and tests drive it exactly.
+        if config.status_interval_secs > 0
+            && status_due(
+                self.last_status,
+                bar.timestamp(),
+                config.status_interval_secs,
+            )
+        {
+            self.last_status = Some(bar.timestamp());
+            let line = format_status_line(
+                bar.timestamp(),
+                self.bars.len(),
+                bar.close(),
+                result.signal,
+                self.session.position_snapshot(),
+                self.session.closed_trades(),
+                result.outcome.state,
+            );
+            println!("{line}");
         }
         Ok(closed_day)
     }
@@ -845,6 +873,61 @@ fn merge_notes(interrupt: Option<String>, jump: Option<String>) -> Option<String
     }
 }
 
+/// True when a periodic `PAPER STATUS` line is due: always on the first bar
+/// (an immediate snapshot of a fresh session), then whenever bar time has
+/// advanced at least `interval_secs` past the previous line. Bar timestamps
+/// are session time, so a stalled feed prints nothing and an out-of-order
+/// bar can never re-trigger a window already printed.
+fn status_due(last: Option<SystemTime>, now: SystemTime, interval_secs: u64) -> bool {
+    last.is_none_or(|prev| {
+        now.duration_since(prev)
+            .is_ok_and(|elapsed| elapsed.as_secs() >= interval_secs)
+    })
+}
+
+/// The periodic `PAPER STATUS` line: one snapshot row of a live session —
+/// bars consumed, the last close, the raw strategy signal, the open position
+/// (side + entry, `none` when flat), the closed-trade count with realized
+/// net P/L so far, and the account's cash/equity after the last bar. The
+/// `PAPER` marker travels with the row so any snippet or forward of it says
+/// plainly that the money figures are simulated-account values — the same
+/// stance as the `MOCK TRADE` lines and the report footer's "paper account
+/// only". Same stdout channel as the mock-trade lines; every figure is a
+/// subset of what the end-of-session report renders anyway, so the line
+/// discloses nothing new.
+#[allow(clippy::too_many_arguments)] // one flat snapshot row; grouping would obscure it
+fn format_status_line(
+    ts: SystemTime,
+    bars: usize,
+    last_close: f64,
+    signal: Signal,
+    position: Option<PositionSnapshot>,
+    closed_trades: &[ClosedTrade],
+    state: BarState,
+) -> String {
+    // The empty trade list sums to -0.0 (f64's sum identity); adding +0.0
+    // normalizes it so a session with no closed trades prints
+    // `realized=+0.00`, never `-0.00`.
+    let realized: f64 = closed_trades.iter().map(|t| t.net_pl).sum::<f64>() + 0.0;
+    let position_text = match position {
+        Some(p) if p.is_long => format!("Long(entry={:.2})", p.entry_price),
+        Some(p) => format!("Short(entry={:.2})", p.entry_price),
+        None => "none".to_owned(),
+    };
+    format!(
+        "[{}] PAPER STATUS bars={} last_close={:.2} signal={:?} position={} closed_trades={} realized={:+.2} cash={:.2} equity={:.2}",
+        utc_stamp(ts),
+        bars,
+        last_close,
+        signal,
+        position_text,
+        closed_trades.len(),
+        realized,
+        state.available,
+        state.equity,
+    )
+}
+
 /// The live mock-trade log: one line per closed paper trade, with the size
 /// that would have been put down, the fees it would have paid and the account
 /// state afterwards. A trade the simulation had to force closed because the
@@ -936,6 +1019,68 @@ mod tests {
 
     use super::*;
     use crate::feed::{TickTrade, WindowUpdate};
+
+    // The boundary case needs exactly 900 seconds; the suggested
+    // `from_mins(15)` rewrite does not help a seconds-precise boundary.
+    #[allow(clippy::duration_suboptimal_units)]
+    #[test]
+    fn status_line_gate_uses_bar_time() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_500_000);
+        // The session's first bar always prints (immediate snapshot).
+        assert!(status_due(None, t0, 900));
+        // Within the interval: not due. At exactly the interval: due.
+        assert!(!status_due(Some(t0), t0 + Duration::from_secs(899), 900));
+        assert!(status_due(Some(t0), t0 + Duration::from_secs(900), 900));
+        // An out-of-order (older) bar never re-triggers a printed window.
+        assert!(!status_due(Some(t0), t0 - Duration::from_secs(60), 900));
+    }
+
+    #[test]
+    fn status_line_formats_the_snapshot() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_500_000);
+        // A consistent flat state: no closed trades, so cash = equity = the
+        // starting balance, and `position=none` is what a raw Flat signal
+        // always leaves behind (a Flat bar closes any open position).
+        let flat_state = BarState {
+            available: 10_000.00,
+            equity: 10_000.00,
+        };
+        let line = format_status_line(t0, 1, 82_566.20, Signal::Flat, None, &[], flat_state);
+        let stamp = utc_stamp(t0);
+        assert_eq!(
+            line,
+            format!(
+                "[{stamp}] PAPER STATUS bars=1 last_close=82566.20 signal=Flat \
+                 position=none closed_trades=0 realized=+0.00 \
+                 cash=10000.00 equity=10000.00"
+            )
+        );
+        // An open long renders side + entry; cash and equity differ by the
+        // position's mark (equity = cash + required margin + unrealized):
+        // 9898.45 + 101.50 + (102.60 - 101.50) = 10001.05.
+        let held = BarState {
+            available: 9_898.45,
+            equity: 10_001.05,
+        };
+        let long_line = format_status_line(
+            t0,
+            5,
+            102.60,
+            Signal::Long,
+            Some(PositionSnapshot {
+                is_long: true,
+                entry_price: 101.50,
+            }),
+            &[],
+            held,
+        );
+        assert!(long_line.contains("PAPER STATUS"), "{long_line}");
+        assert!(
+            long_line.contains("position=Long(entry=101.50)"),
+            "{long_line}"
+        );
+        assert!(long_line.contains("signal=Long"), "{long_line}");
+    }
 
     /// A window with sane OHLC around `close`, one minute long, for `AAPL`.
     fn window_update(start_ms: u64, close: f64) -> WindowUpdate {

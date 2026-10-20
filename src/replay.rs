@@ -12,7 +12,9 @@
 //! an identical offline re-replay **by construction**.
 
 use crate::{
-    accounting::{BarOutcome, ClosedTrade, DayTotal, PaperAccount, SessionTotals},
+    accounting::{
+        BarOutcome, ClosedTrade, DayTotal, PaperAccount, PositionSnapshot, SessionTotals,
+    },
     config::Config,
     csv,
     engine::Engine,
@@ -104,6 +106,20 @@ impl ReplaySession {
     #[must_use]
     pub const fn bar_count(&self) -> usize {
         self.trace_lines.len()
+    }
+
+    /// The paper account's closed trades so far (exit order) — the live
+    /// session's periodic `STATUS` line rolls these up mid-session.
+    #[must_use]
+    pub fn closed_trades(&self) -> &[ClosedTrade] {
+        self.account.closed_trades()
+    }
+
+    /// Snapshot of the currently open position, if any — for the live
+    /// session's periodic `STATUS` line.
+    #[must_use]
+    pub fn position_snapshot(&self) -> Option<PositionSnapshot> {
+        self.account.position_snapshot()
     }
 
     /// Prices `bar` through the engine and paper account, appending its trace
