@@ -17,7 +17,7 @@ sources:
   - id: mainrs
     resource: /src/main.rs
     title: Binary entry-point source
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
 ---
 
 Replay answers the question *"do these settings behave the way I expect on
@@ -62,9 +62,13 @@ cargo run -- replay samples/sample-bars.csv
 
 The `replay` subcommand takes **exactly one argument** (the bar-file path).
 A bare `replay`, extra arguments, or any other first argument are rejected with
-a usage error and exit code 1. `live` is the only other subcommand and takes no
-arguments; the shared usage line is
-`usage: price-action <replay <bars.csv> | live>`.[^mainrs]
+a usage error and exit code 1. The sibling subcommands are `kraken backtest`
+(fetches recent **real** Kraken candles and renders this same report under the
+source label `kraken` — see
+[Kraken Market Data & Keys](kraken-market-data.md)), `kraken check-keys`
+(diagnoses the optional read-only Kraken key pair) and `live` (takes no
+arguments); the shared usage line is
+`usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | kraken check-keys | live>`.[^mainrs]
 
 ### The same pipeline, a different data source
 

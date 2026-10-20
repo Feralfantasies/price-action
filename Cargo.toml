@@ -29,6 +29,16 @@ tokio-rustls = { version = "0.26.5", default-features = false }
 webpki-roots = "0.26.11"
 futures-util = "0.3.34"
 serde_json = "1.0.151"
+# Kraken's *private* REST endpoints (used here for exactly one read-only
+# account check — see docs/kraken-market-data.md) authenticate with an
+# `API-Sign` header: base64 HMAC-SHA512 keyed with the base64-decoded secret.
+# `crypto` is pure Rust with no C backend, so the scratch-image binding rule
+# (static musl, TLS via rustls, never OpenSSL/native-tls) is untouched: it is
+# not a TLS provider. Hand-rolling SHA-512/HMAC/base64 instead would fight this
+# repo's `indexing_slicing`/`panic` lint set (the compression loop indexes
+# arrays pervasively) for no safety gain, so the primitive comes from a crate.
+hmac = "0.13.0"
+sha2 = "0.11.0"
 
 [workspace.lints.clippy]
 # Pedantic lints enforce careful, idiomatic code. Kept as deny; instances are

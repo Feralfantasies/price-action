@@ -34,6 +34,7 @@ pub mod engine;
 pub mod error;
 pub mod execution;
 pub mod feed;
+pub mod kraken;
 pub mod live;
 pub mod market;
 pub mod notify;

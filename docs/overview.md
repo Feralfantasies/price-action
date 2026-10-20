@@ -11,7 +11,7 @@ sources:
   - id: librs
     resource: /src/lib.rs
     title: Crate root module documentation
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
 ---
 
 `price-action` is an automated price-action trading project written in Rust.
@@ -27,8 +27,9 @@ market → strategy → engine → execution
 
 market data arrives either
   • replay  — bars read from a CSV file        (offline, step 1)
-  • live    — bars streamed from a WebSocket   (real-time, still paper)
-both feed the SAME engine + strategy + funded paper account
+  • kraken  — committed candles over REST      (`kraken backtest`, real crypto)
+  • live    — bars streamed from a WebSocket   (Massive.com or Kraken)
+all feed the SAME engine + strategy + funded paper account
 ```
 
 | Crate | Role | Doc |
@@ -41,11 +42,12 @@ both feed the SAME engine + strategy + funded paper account
 | `src/replay.rs` | Replay runner + `ReplaySession`, the per-bar pipeline both paths share, + the human-readable report (trace, trade tables, roll-ups) | [Replay Workflow](replay-workflow.md) |
 | `src/accounting.rs` | Funded paper account the report prices with: fees, P/L, UTC-day bucketing | [Paper Trading Accounting](paper-trading-accounting.md) |
 | `src/feed.rs` | The Massive.com stocks WebSocket: framing, auth, subscribe, reconnect/backoff (transport only) | [Live Market-Data Session](live-market-data-session.md) |
+| `src/kraken.rs` | Kraken market data: public REST candles + pair resolution, Spot WebSocket v2 transport, and the optional read-only signed request path | [Kraken Market Data & Keys](kraken-market-data.md) |
 | `src/live.rs` | Live sessions: event → bar shaping, gap notes, the session loop, daily summaries, CSV persistence | [Live Market-Data Session](live-market-data-session.md) |
 | `src/notify.rs` | Telegram delivery of a live session's daily summaries (`sendMessage` over rustls) | [Telegram Notifications](telegram-notifications.md) |
 | `src/config.rs` | Layered configuration: env → config file → defaults | [Configuration](configuration.md) |
 | `src/error.rs` | Shared `Error` type (`MarketData` / `Execution` / `Strategy` / `Config`) | — |
-| `src/main.rs` | Binary entry point: no-args readiness check, the `replay` and `live` subcommands | [Development Workflow](development-workflow.md) |
+| `src/main.rs` | Binary entry point: no-args readiness check, the `replay`, `kraken backtest`, `kraken check-keys` and `live` subcommands | [Development Workflow](development-workflow.md) |
 
 # Scope (current state)
 
@@ -55,14 +57,18 @@ both feed the SAME engine + strategy + funded paper account
   path returns `"live trading is not implemented yet; run in paper mode"`.
   Today there is exactly one broker implementation: the in-memory
   `PaperBroker`, which tracks a position but never places orders.
-- **Market data now has two sources.** Recorded bars are replayed from a CSV
-  (`replay <bars.csv>`), and real-time bars are streamed from the Massive.com
-  stocks WebSocket (`live`) — see
-  [Live Market-Data Session](live-market-data-session.md). The two paths
-  converge immediately: `live` feeds its shaped bars into the same
-  `ReplaySession` replay uses, so entries, fees, roll-ups and trace lines come
+- **Market data now has three paths.** Recorded bars are replayed from a CSV
+  (`replay <bars.csv>`); recent **real** crypto candles are fetched from
+  Kraken's public REST API (`kraken backtest`); and real-time bars are streamed
+  from a WebSocket (`live`) — the Massive.com stocks feed or Kraken's public
+  Spot v2 OHLC channel — see
+  [Live Market-Data Session](live-market-data-session.md) and
+  [Kraken Market Data & Keys](kraken-market-data.md). The paths
+  converge immediately: each feeds the same
+  `ReplaySession`, so entries, fees, roll-ups and trace lines come
   from one implementation. **Broker/venue adapters still do not exist** — the
-  live feed is data-in only and cannot place an order.
+  feeds are data-in only and cannot place an order; even the optional
+  read-only Kraken API-key pair can only read one balance endpoint.
 - **"Live" describes the data, never the execution.** A live session trades a
   funded fake balance, logs each mock trade with its size, committed notional,
   per-side fees and running cash/equity, persists its bars as a

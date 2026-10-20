@@ -11,7 +11,7 @@ sources:
   - id: code-quality
     resource: /README.md
     title: README "Code quality" section
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-18T19:30:00Z }
 ---
 
 The project is strict about what counts as passing code.[^toml][^code-quality]
@@ -24,6 +24,8 @@ The project is strict about what counts as passing code.[^toml][^code-quality]
   - Live market data: `tokio` (rt-multi-thread, macros, sync, time, signal,
     net, io-util), `tokio-tungstenite` with `rustls-tls-webpki-roots`,
     `futures-util`, `serde_json`.
+  - Kraken request signing (optional read-only key check): `hmac`, `sha2`
+    (HMAC-SHA512 + SHA-256; base64 is hand-rolled in `src/kraken.rs`).
   - TLS for the feed and Telegram delivery: `rustls` (with the **`ring`**
     provider selected explicitly), `tokio-rustls`, `webpki-roots`.
   - There is **no HTTP client crate**: `src/notify.rs` sends one `sendMessage`
@@ -78,8 +80,10 @@ cargo run -- replay samples/sample-bars.csv   # expected output per Replay Workf
 ```
 
 The `live` subcommand has its own smoke cases (see
-[Live Market-Data Session](live-market-data-session.md)). The usage line now
-covers both subcommands: `usage: price-action <replay <bars.csv> | live>`.
+[Live Market-Data Session](live-market-data-session.md)), as do the `kraken`
+subcommands (see [Kraken Market Data & Keys](kraken-market-data.md)). The
+usage line covers every shape:
+`usage: price-action <replay <bars.csv> | kraken backtest [--pair <FORM>] [--interval <SECS>] | kraken check-keys | live>`.
 
 ```sh
 cargo run -- live               # fails fast, exit 1: needs PRICE_ACTION_MASSIVE_API_KEY
@@ -95,6 +99,24 @@ PRICE_ACTION_MASSIVE_API_KEY=dummy cargo run -- live
 # summary goes to the console only. With exactly one set, `live` fails fast
 # naming the missing half.
 PRICE_ACTION_TELEGRAM_BOT_TOKEN=x cargo run -- live   # exit 1, names telegram_chat_id
+```
+
+```sh
+# Kraken smoke cases — public data needs no key:
+cargo run -- kraken bogus       # rejected: names the two real subcommands
+cargo run -- kraken backtest --pair XBT/USD --interval 60   # real network: public candles → paper report
+cargo run -- kraken backtest --interval 42                  # rejected: not a Kraken interval
+cargo run -- kraken check-keys  # exit 1: names both PRICE_ACTION_KRAKEN_* variables
+PRICE_ACTION_KRAKEN_API_KEY=x cargo run -- kraken check-keys   # exit 1: names the missing half
+
+# Reaches Kraken with a correctly signed POST; the fake pair is refused
+# upstream with Kraken's own `EAPI:Invalid key` business error (verified
+# 2026-10-18: the request shape and signature are accepted far enough for
+# key validation to answer) and the error leaks nothing secret.
+# The secret below is the unit-test fixture ("test-secret-key-1234567890").
+PRICE_ACTION_KRAKEN_API_KEY=fake \
+  PRICE_ACTION_KRAKEN_PRIVATE_KEY=dGVzdC1zZWNyZXQta2V5LTEyMzQ1Njc4OTA= \
+  cargo run -- kraken check-keys
 ```
 
 Anything that needs a genuine credential (a real market-data key, a real
@@ -115,7 +137,7 @@ release to GHCR — **a red or broken push can publish a bad image.** See
 
 | Path | Purpose |
 |---|---|
-| `src/` | Crate (pipeline modules listed in [Overview](overview.md)), including `feed.rs` / `live.rs` / `notify.rs` for the live path. |
+| `src/` | Crate (pipeline modules listed in [Overview](overview.md)), including `feed.rs` / `live.rs` / `notify.rs` for the live path and `kraken.rs` for the Kraken data sources. |
 | `sessions/` | Default `live_csv_dir`: CSVs persisted by live sessions (not committed; gitignored). |
 | `samples/sample-bars.csv` | Synthetic demo dataset — see [Sample Bar File](sample-bars.md); do not repurpose for real data. |
 | `price-action.example.toml` | Reference config; copy to `price-action.toml` or set `PRICE_ACTION_CONFIG`. |
