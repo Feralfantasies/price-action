@@ -23,7 +23,7 @@ sources:
   - id: configsrc
     resource: /src/config.rs
     title: Live-session configuration keys and load_for_live validation
-generated: { by: pi-agent/qwen3.8-max, at: 2026-10-18T19:30:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-20T15:45:00Z }
 ---
 
 `price-action live` answers a different question from
@@ -233,6 +233,27 @@ the bar. A leveraged session (`max_leverage > 1`) marks its size as
 `x<quantity> @<leverage>x` and a force-closed trade carries `[liquidated]`,
 so its lines are distinguishable from an unleveraged run — whose shape above
 is unchanged.[^livers]
+
+## Periodic status line (opt-in)
+
+With `status_interval_secs` set (env `PRICE_ACTION_STATUS_INTERVAL_SECS`;
+default `0` = off), each bar whose timestamp is at least that many seconds
+past the previous status line prints one snapshot row on stdout:
+
+```text
+[2026-10-20T15:30:00Z] STATUS bars=147 last_close=115342.10 signal=Flat position=Long(entry=114980.00) closed_trades=2 realized=-1.10 cash=9998.90 equity=10361.22
+```
+
+Bars consumed, the last close, the raw strategy signal, the open position
+(side + entry price; `none` when flat), the closed-trade count with realized
+net P/L so far, and the account's cash/equity after the last bar — every
+figure a subset of what the end-of-session report renders anyway, so the line
+discloses nothing new. The session's **first bar prints immediately** (no
+interval wait on a fresh pod). The gate uses **bar timestamps**, not the wall
+clock: a stalled feed prints nothing stale, and an out-of-order bar cannot
+re-trigger a printed window. This is the mid-session answer to "how is it
+doing?" between daily summaries — the deployment in the cluster sets it to
+900 (15 minutes).[^livers]
 
 ## Daily summaries
 
