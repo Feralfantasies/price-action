@@ -167,7 +167,7 @@ What you get:
   any position still open. A quiet day still reports (zero activity, unchanged
   balance).
 - **Periodic status snapshots** (opt-in): with `PRICE_ACTION_STATUS_INTERVAL_SECS`
-  set (e.g. `900` for 15 minutes), one `STATUS` line prints per interval —
+  set (e.g. `900` for 15 minutes), one `PAPER STATUS` line prints per interval —
   bars so far, last close, signal, open position, closed trades and realized
   P/L, cash/equity — so `kubectl logs` answers "how is it doing?" without
   waiting for midnight. Default `0` prints none.

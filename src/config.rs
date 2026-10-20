@@ -110,12 +110,13 @@ pub struct Config {
     pub mode: Mode,
     /// Bar interval in seconds. Must be at least 1.
     pub bar_interval_secs: u64,
-    /// Live-session only: minimum seconds between periodic `STATUS` snapshot
-    /// lines on stdout (bar count, last close, raw signal, open position,
-    /// closed-trade roll-up, cash/equity). `0` — the default — prints none,
-    /// exactly the historical behaviour. Values below the bar cadence
-    /// effectively print one line per bar. Replay and the no-args path never
-    /// read this.
+    /// Live-session only: minimum seconds between periodic `PAPER STATUS`
+    /// snapshot lines on stdout (bar count, last close, raw signal, open
+    /// position, closed-trade roll-up, cash/equity — all simulated-account
+    /// figures). `0` — the default — prints none, exactly the historical
+    /// behaviour. Values below the bar cadence effectively print one line
+    /// per bar. Only `live` emits these lines; replay and the no-args path
+    /// load the value like any other setting but never print one.
     pub status_interval_secs: u64,
     /// Number of recent bars retained in the rolling window.
     pub series_capacity: usize,

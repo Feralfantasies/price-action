@@ -238,17 +238,23 @@ is unchanged.[^livers]
 
 With `status_interval_secs` set (env `PRICE_ACTION_STATUS_INTERVAL_SECS`;
 default `0` = off), each bar whose timestamp is at least that many seconds
-past the previous status line prints one snapshot row on stdout:
+past the previous status line prints one snapshot row on stdout (a real line
+from a Kraken smoke run):
 
 ```text
-[2026-10-20T15:30:00Z] STATUS bars=147 last_close=115342.10 signal=Flat position=Long(entry=114980.00) closed_trades=2 realized=-1.10 cash=9998.90 equity=10361.22
+[2026-10-20T18:51:00Z] PAPER STATUS bars=1 last_close=82415.40 signal=Flat position=none closed_trades=0 realized=+0.00 cash=10000.00 equity=10000.00
 ```
 
 Bars consumed, the last close, the raw strategy signal, the open position
-(side + entry price; `none` when flat), the closed-trade count with realized
-net P/L so far, and the account's cash/equity after the last bar — every
+(side + entry price; `none` when flat — a raw `Flat` signal always closes an
+open position, so `signal=Flat` and a held position never appear together),
+the closed-trade count with realized net P/L so far, and the account's
+cash/equity after the last bar (equal while flat) — every
 figure a subset of what the end-of-session report renders anyway, so the line
-discloses nothing new. The session's **first bar prints immediately** (no
+discloses nothing new. The `PAPER` marker travels with the row so any snippet
+or forward of it says plainly that the money figures are simulated (the same
+stance as the `MOCK TRADE` lines and the report footer). The session's
+**first bar prints immediately** (no
 interval wait on a fresh pod). The gate uses **bar timestamps**, not the wall
 clock: a stalled feed prints nothing stale, and an out-of-order bar cannot
 re-trigger a printed window. This is the mid-session answer to "how is it
