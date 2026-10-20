@@ -8,7 +8,7 @@ sources:
   - id: disclaimer-md
     resource: /DISCLAIMER.md
     title: Full disclaimer document (governing text)
-generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-18T19:30:00Z }
 ---
 
 **This software is for educational and research purposes only and is not
@@ -47,7 +47,7 @@ docs, READMEs, or commits they change. Summary:
   funding rates, no tiered fees. See
   [Paper Trading Accounting](paper-trading-accounting.md).
 - **Even the optional Kraken key pair can only read.** The one private call in
-  the codebase is a single signed `GET /0/private/Balance` used to verify
+  the codebase is a single signed `POST /0/private/Balance` used to verify
   credentials (`kraken check-keys`, or at Kraken-source `live` startup); there
   is no order path for any key to reach. See
   [Kraken Market Data & Keys](kraken-market-data.md).

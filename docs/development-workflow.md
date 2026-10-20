@@ -11,7 +11,7 @@ sources:
   - id: code-quality
     resource: /README.md
     title: README "Code quality" section
-generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-18T19:30:00Z }
 ---
 
 The project is strict about what counts as passing code.[^toml][^code-quality]
@@ -109,8 +109,10 @@ cargo run -- kraken backtest --interval 42                  # rejected: not a Kr
 cargo run -- kraken check-keys  # exit 1: names both PRICE_ACTION_KRAKEN_* variables
 PRICE_ACTION_KRAKEN_API_KEY=x cargo run -- kraken check-keys   # exit 1: names the missing half
 
-# Reaches Kraken with a correctly signed request; the fake pair is refused
-# upstream (HTTP 404 / EAPI:Invalid key) and the error leaks nothing secret.
+# Reaches Kraken with a correctly signed POST; the fake pair is refused
+# upstream with Kraken's own `EAPI:Invalid key` business error (verified
+# 2026-10-18: the request shape and signature are accepted far enough for
+# key validation to answer) and the error leaks nothing secret.
 # The secret below is the unit-test fixture ("test-secret-key-1234567890").
 PRICE_ACTION_KRAKEN_API_KEY=fake \
   PRICE_ACTION_KRAKEN_PRIVATE_KEY=dGVzdC1zZWNyZXQta2V5LTEyMzQ1Njc4OTA= \

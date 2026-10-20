@@ -1045,6 +1045,7 @@ kraken_api_key = "file-key"
         );
         let err = Config::load_live_from(&path, &env_from(BTreeMap::new())).unwrap_err();
         assert!(err.to_string().contains("kraken_api_key"), "{err}");
+        let _ = std::fs::remove_file(&path); // leave no test artifact behind
     }
 
     #[test]

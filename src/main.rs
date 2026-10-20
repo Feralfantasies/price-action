@@ -13,8 +13,8 @@
 //! - with `kraken check-keys`, verifies an optionally injected read-only
 //!   Kraken API-key pair (`PRICE_ACTION_KRAKEN_API_KEY` +
 //!   `PRICE_ACTION_KRAKEN_PRIVATE_KEY`) with one signed read of the account
-//!   balance and prints a masked summary — no order is ever sent;
-//!   or
+//!   balance and prints a one-line summary carrying no key material — no
+//!   order is ever sent; or
 //! - with `live`, streams real-time bars — from the Massive.com stocks
 //!   WebSocket (the default source, which takes an API key) or Kraken's
 //!   public Spot WebSocket v2 OHLC channel (`PRICE_ACTION_LIVE_FEED_SOURCE=
@@ -101,8 +101,9 @@ fn run_replay(path: &str) -> Result<(), Error> {
 const DEFAULT_KRAKEN_INTERVAL_SECS: u32 = 300;
 
 /// `kraken check-keys` — verifies the optional read-only Kraken API-key pair
-/// with one signed `GET /0/private/Balance` (see
-/// [`kraken::authenticated_check`]) and prints a masked one-line summary.
+/// with one signed `POST /0/private/Balance` (see
+/// [`kraken::authenticated_check`]) and prints a one-line summary carrying
+/// no key material.
 /// **No order is ever sent** — this crate has no order path at all.
 ///
 /// The two env variables are read directly here rather than through
@@ -402,7 +403,7 @@ fn run_live() -> Result<(), Error> {
             }
             // Neither or both prepared: a bug in the setup above, not input.
             _ => return Err(Error::Execution(
-                "no exactly one live feed source was prepared".to_string(),
+                "exactly one live feed source must be prepared".to_string(),
             )),
         };
 

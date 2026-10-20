@@ -61,15 +61,16 @@
 //! When (and only when) **both** `PRICE_ACTION_KRAKEN_API_KEY` and
 //! `PRICE_ACTION_KRAKEN_PRIVATE_KEY` are present in the environment,
 //! [`authenticated_check`] verifies them against one read-only private call —
-//! `GET /0/private/Balance` with no parameters — and prints which key was used
-//! (the first six characters masked) **with every balance figure stripped**:
-//! balances belong on a screen, never in this log line. The two headers are
-//! exactly Kraken's documented private-api scheme: `API-Key` (the raw API key
-//! string) and `API-Sign` — the body bytes plus the *hex digest of* SHA-256(
-//! `nonce`) concatenated, HMAC-SHA512-keyed with the base64-decoded secret,
-//! rendered as standard base64. The nonce is wall-clock Unix seconds (a
-//! repeatable value within one second window), which is what makes that
-//! double-hash step necessary. Two hard invariants: **no endpoint of this
+//! `POST /0/private/Balance` with a `nonce=<ms>` form body — and prints a
+//! one-line summary **carrying no key material and every balance figure
+//! stripped**: both belong on a screen the operator controls, never in this
+//! log line. The two headers are exactly Kraken's documented private-api
+//! scheme: `API-Key` (the raw API key string) and `API-Sign` —
+//! base64( HMAC-SHA512( key = base64-decoded secret, msg = URI path bytes +
+//! SHA-256(nonce string + POST data) as raw digest bytes ) ). The nonce is
+//! Unix milliseconds forced strictly increasing per process, because Kraken
+//! rejects any nonce it has already seen for a key (`EAPI:Invalid nonce`).
+//! Two hard invariants: **no endpoint of this
 //! binary can send an order or transfer funds** — the sole private path is
 //! this key liveness check, called by `kraken check-keys` (CLI) and by the
 //! `live` session at startup (the check failure never blocks a session that
@@ -77,6 +78,7 @@
 //! neither key half ever appears in logs, reports, CSVs, error text or
 //! `Debug` output ([`crate::config::Config`] redacts both fields).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -492,21 +494,24 @@ async fn http_get(path_query: &str) -> Result<String, crate::error::Error> {
     Ok(text)
 }
 
-/// One authenticated REST GET against [`REST_HOST`]: the same connect/read
+/// One authenticated REST POST against [`REST_HOST`]: the same connect/read
 /// envelope as [`http_get`], but the request carries the `API-Key` and
 /// `API-Sign` headers (both supplied already computed — signing is pure, see
-/// [`api_sign_request_bytes`]) and a body for the form-encoded parameters.
+/// [`api_sign_request_bytes`]) and the form-encoded POST body Kraken's
+/// private endpoints require (at minimum `nonce=<n>`). The method is part of
+/// the contract: Kraken answers a GET on a private path with 404.
 /// Unit tests stand in for the whole TLS stream with a `tokio::io::duplex`
 /// pair exactly as they do for [`read_response`], so this seam keeps the one
 /// private request of this binary socket-free under test. The body is never
-/// logged and cannot name credentials: by construction it is empty (the only
-/// endpoint that signs requests takes no parameters, [`authenticated_check`]).
-async fn http_private_get(
+/// logged and cannot name credentials: it carries the nonce (and any form
+/// parameters), never a key half — see [`authenticated_check`].
+async fn http_private_post(
     url_path: &str,
     api_key_header: &str,
     api_sign_header: &str,
+    body: &str,
 ) -> Result<String, crate::error::Error> {
-    let request = api_sign_request_bytes(url_path, api_key_header, api_sign_header, "");
+    let request = api_sign_request_bytes(url_path, api_key_header, api_sign_header, body);
     let stream = connect_tls_rest().await?;
     let result = tokio::time::timeout(REQUEST_TIMEOUT, read_response(stream, &request))
         .await
@@ -632,14 +637,14 @@ fn build_rev_table() -> [u8; 256] {
     table
 }
 
-/// The exact request bytes for one **authenticated** GET. Body is form-encoded.
-/// In this crate it is always empty (the only signing-capable endpoint is
-/// parameterless), but the seam keeps the parameter path honest if a private
-/// call ever needs arguments: they are percent-encoded before concatenation,
-/// never raw. Neither `api_key_header` nor `api_sign_header` derives from any
-/// user input at this point — one is the configured key and the other the
-/// already-computed signature of (empty body + nonce), so nothing secret can
-/// leak into a log line that prints these bytes for debugging.
+/// The exact request bytes for one **authenticated** POST. `body` is the
+/// form-encoded POST data whose bytes were signed (at minimum `nonce=<n>`);
+/// callers that ever add parameters percent-encode them into this string, so
+/// the signed bytes and the sent bytes are one and the same. Neither
+/// `api_key_header` nor `api_sign_header` derives from any user input at this
+/// point — one is the configured key and the other the already-computed
+/// signature — so nothing secret can leak into a log line that prints these
+/// bytes for debugging.
 #[must_use]
 pub(crate) fn api_sign_request_bytes(
     url_path: &str,
@@ -647,33 +652,42 @@ pub(crate) fn api_sign_request_bytes(
     api_sign_header: &str,
     body: &str,
 ) -> Vec<u8> {
-    let _ = encode_query_value(body); // body is form-encoded when non-empty
     format!(
-        "GET {url_path} HTTP/1.1\r\n\
+        "POST {url_path} HTTP/1.1\r\n\
          Host: {REST_HOST}\r\n\
          Accept: */*\r\n\
          Connection: close\r\n\
          User-Agent: price-action/paper-trading\r\n\
          Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\n\
          API-Key: {api_key_header}\r\n\
          API-Sign: {api_sign_header}\r\n\
-         \r\n{body}"
+         \r\n{body}",
+        body.len()
     )
     .into_bytes()
 }
 
 /// The `API-Sign` header value for one private request, exactly per Kraken's
-/// documented scheme: base64( HMAC-SHA512( key = `base64_decode(secret)`,
-/// msg = body bytes + `hex_sha256(nonce)` ) ). All three building blocks are
-/// pure, so the whole signature is a unit-tested known-answer — and this is
-/// the **only** function in this crate that ever looks at the secret: keys
-/// flow into headers, never into logs, errors or reports (see the module
-/// doc's private-REST section). The double hash (SHA-256 of the nonce before
-/// feeding it to HMAC) is Kraken's own rule, repeated here verbatim rather
-/// than "improved": a deviation would sign correctly for nothing and reject
-/// cleanly against the real service.
+/// documented scheme:
+/// base64( HMAC-SHA512( key = `base64_decode(secret)`,
+/// msg = `url_path` bytes + SHA-256(`nonce` string + `post_data`) as raw
+/// digest bytes ) ) — cross-checked against the reference implementation in
+/// CCXT's kraken `sign()`. All building blocks are pure, so the whole
+/// signature is a unit-tested known-answer — and this is the **only**
+/// function in this crate that ever looks at the secret: keys flow into
+/// headers, never into logs, errors or reports (see the module doc's
+/// private-REST section). `post_data` must be byte-identical to the request
+/// body that gets sent (Kraken recomputes the same hash server-side), which
+/// is why [`authenticated_check`] builds the body once and passes it to both
+/// this function and the transport.
 #[must_use]
-pub(crate) fn api_sign(secret_b64: &str, nonce_secs: i64, body: &str) -> Option<String> {
+pub(crate) fn api_sign(
+    url_path: &str,
+    secret_b64: &str,
+    nonce: u64,
+    post_data: &str,
+) -> Option<String> {
     let key = base64_decode(secret_b64)?;
     if key.is_empty() {
         return None; // an empty secret is not a usable key
@@ -681,56 +695,46 @@ pub(crate) fn api_sign(secret_b64: &str, nonce_secs: i64, body: &str) -> Option<
     // HMAC accepts keys of any length, so this construction cannot actually
     // fail; the `?` only keeps the panic-prevention lint set satisfied.
     let mut mac = Hmac::<Sha512>::new_from_slice(&key).ok()?;
-    mac.update(body.as_bytes());
-    let nonce_hash = sha2_digest_hex(nonce_secs.to_string().as_bytes());
-    mac.update(nonce_hash.as_bytes());
+    mac.update(url_path.as_bytes());
+    mac.update(sha256_raw(format!("{nonce}{post_data}").as_bytes()).as_slice());
     Some(base64_encode(mac.finalize().into_bytes().as_slice()))
 }
 
-/// Lowercase hex of SHA-256(`data`) — the inner hash Kraken's signing scheme
-/// asks for (their docs: "SHA256 of the nonce, hex-encoded"), computed over
-/// the nonce string before the HMAC-SHA512 outer MAC consumes it.
+/// Raw (binary, not hex) SHA-256 digest — the exact form Kraken's scheme
+/// concatenates with the URI path before the HMAC-SHA512 outer MAC.
 #[must_use]
-pub(crate) fn sha2_digest_hex(data: &[u8]) -> String {
-    let digest = Sha256::digest(data);
-    // Interleave high/low nibble per byte — chaining the two nibble streams
-    // would concatenate all high nibbles before all low ones.
-    digest
-        .iter()
-        .flat_map(|b| [b >> 4, b & 0x0F])
-        .map(|n| char::from(HEX_LOWER.get(usize::from(n)).copied().unwrap_or(b'0')))
-        .collect()
+fn sha256_raw(data: &[u8]) -> Vec<u8> {
+    Sha256::digest(data).to_vec()
 }
 
-const HEX_LOWER: &[u8] = b"0123456789abcdef";
-
-/// The nonce this binary generates: current Unix time in seconds. Kraken
-/// accepts the clock within roughly a window around "now", so any single
-/// request signed once at startup is valid for its few-millisecond lifetime
-/// even if the peer queues it; the point of the rule is replay resistance,
-/// which a seconds-granular nonce gives us for free because no two *real*
-/// requests in separate calls reuse the value.
-pub(crate) fn current_unix_secs_now() -> i64 {
-    // 1:1 wall clock read, same source as [`crate::main::current_unix_secs`]
-    // (which is binary-side); kept in-crate so library consumers and tests
-    // exercise one code path.
-    SystemTime::now()
+/// The nonce for private requests: Unix **milliseconds**, forced strictly
+/// increasing per process. Kraken rejects any nonce it has already seen for
+/// an API key (`EAPI:Invalid nonce`), so two calls inside the same
+/// millisecond — or a backwards clock step — must not reuse a value: each
+/// call returns at least the previous one plus one. One process signs for at
+/// most one key pair (the optional read-only check), so a single
+/// process-wide counter satisfies "increasing per key" by construction.
+pub(crate) fn next_nonce_ms() -> u64 {
+    let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
-/// Masks an API key for display: the first six characters, then `…`. Shorter
-/// inputs collapse to just `…` — a key is never printable in full anywhere,
-/// not in this check's output, logs, errors or reports.
-#[must_use]
-pub(crate) fn mask_key(api_key: &str) -> String {
-    if api_key.chars().count() > 6 {
-        let prefix: String = api_key.chars().take(6).collect();
-        format!("{prefix}…")
-    } else {
-        "…".to_owned()
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let mut previous = LAST_NONCE_MS.load(Ordering::Relaxed);
+    loop {
+        let next = now_ms.max(previous.saturating_add(1));
+        match LAST_NONCE_MS.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
     }
 }
+
+/// The last handed-out nonce value; see [`next_nonce_ms`].
+static LAST_NONCE_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Pure summary of an already-decoded `/0/private/Balance` reply for
 /// [`authenticated_check`] — how many assets the account reports, nothing
@@ -749,12 +753,19 @@ fn parse_balance_reply(reply: &Value) -> Result<String, crate::error::Error> {
     Ok(format!("{} asset balance(s) visible", assets.len()))
 }
 
+/// The one private endpoint this binary ever calls: account balances, used
+/// read-only as a key-liveness check.
+const PRIVATE_BALANCE_PATH: &str = "/0/private/Balance";
+
 /// Verifies a Kraken API-key pair with one **read-only** private call:
-/// `GET /0/private/Balance`, signed per [`api_sign`].
+/// `POST /0/private/Balance` with a `nonce=<ms>` form body, signed per
+/// [`api_sign`].
 ///
-/// Returns a one-line masked summary on success. No order is ever placed —
-/// this binary is paper-only in every mode — and the secret is used only as
-/// HMAC key material; it never appears in the return value, logs or errors.
+/// Returns a one-line summary on success that carries **no key material**
+/// (neither half is ever printed, not even a prefix) and no balance values.
+/// No order is ever placed — this binary is paper-only in every mode — and
+/// the secret is used only as HMAC key material; it never appears in the
+/// return value, logs or errors.
 ///
 /// # Errors
 ///
@@ -777,14 +788,17 @@ pub async fn authenticated_check(
             "kraken private key is not standard base64 — re-copy it from Kraken".to_owned(),
         ));
     }
-    let nonce = current_unix_secs_now();
-    let sign = api_sign(secret_b64, nonce, "").ok_or_else(|| {
+    // Build the POST body ONCE: Kraken recomputes SHA-256(nonce + post data)
+    // server-side, so the bytes handed to `api_sign` and to the transport
+    // must be identical — any divergence is an `EAPI:Invalid signature`.
+    let nonce = next_nonce_ms();
+    let post_data = format!("nonce={nonce}");
+    let sign = api_sign(PRIVATE_BALANCE_PATH, secret_b64, nonce, &post_data).ok_or_else(|| {
         crate::error::Error::Config("kraken private key could not initialize signing".to_owned())
     })?;
-    let response = http_private_get("/0/private/Balance", api_key, &sign).await?;
-    let reply = decode_rest_reply(&response, "/0/private/Balance")?;
-    let summary = parse_balance_reply(&reply)?;
-    Ok(format!("{} — {}", mask_key(api_key), summary))
+    let response = http_private_post(PRIVATE_BALANCE_PATH, api_key, &sign, &post_data).await?;
+    let reply = decode_rest_reply(&response, PRIVATE_BALANCE_PATH)?;
+    parse_balance_reply(&reply)
 }
 
 /// True when the response's first line is an HTTP status line carrying a 2xx
@@ -2254,55 +2268,72 @@ mod tests {
     }
 
     #[test]
-    fn sha2_digest_hex_matches_known_answers() {
-        // SHA-256, FIPS 180-4 examples — the inner hash of Kraken's scheme.
-        assert_eq!(
-            sha2_digest_hex(b""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            sha2_digest_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn api_sign_matches_independently_computed_known_answer() {
+    fn api_sign_matches_reference_implementation_known_answers() {
         // Secret is "test-secret-key-1234567890" in standard base64 (an
         // obviously fake value — never a real key). The signatures below were
-        // computed independently with python `hmac`/`hashlib` for nonce
-        // 1791310020: msg = body bytes + hex(sha256("1791310020")).
+        // computed independently (node `crypto`) from Kraken's documented
+        // scheme — msg = url_path + SHA-256_raw(nonce + post_data) — and
+        // cross-checked against CCXT's kraken `sign()`: path
+        // `/0/private/Balance`, nonce 1791310020000 (Unix ms).
         let secret = "dGVzdC1zZWNyZXQta2V5LTEyMzQ1Njc4OTA=";
         assert_eq!(
-            api_sign(secret, 1_791_310_020, "").as_deref(),
-            Some("uTiE2F7dfztlpq8r8kfPG+yMCHxwuF0N/eblPoTQCBfzi6YboqkE5aCmrM06/UDF64IuO2xtyJLTkk05WMWhiQ==")
+            api_sign(
+                "/0/private/Balance",
+                secret,
+                1_791_310_020_000,
+                "nonce=1791310020000"
+            )
+            .as_deref(),
+            Some("eoXTbSAfkOFYi0KZQsn9yDVV4VK2xVFcNi7ozlvIcwS03D/MW+AssoL/djky8JiQ3AeqnkfgNjZb/nbcf9dcmg==")
         );
-        // The same key and nonce over a non-empty form body — the parameter
-        // path `api_sign_request_bytes` keeps honest.
+        // The same key and nonce with one extra form parameter — the
+        // parameter path `api_sign_request_bytes` keeps honest.
         assert_eq!(
-            api_sign(secret, 1_791_310_020, "asset=XBT").as_deref(),
-            Some("Z7hJBHqa/WyCmOoUGRaBWBTotE8vpIBHlKt6f2hnw81qg64S3KGMB+CnY9WOMCImn8yovQNB+ymfEttEqLE7CA==")
+            api_sign(
+                "/0/private/Balance",
+                secret,
+                1_791_310_020_000,
+                "nonce=1791310020000&ofs=0"
+            )
+            .as_deref(),
+            Some("8zB+mfhYq8Mnvve+fkpf55CFfGfno/vVGlecnwI1RWcWnV4PWZsoGZgDfkBQhGX4lDCuUNy0i/9FOKMJuhGbEw==")
         );
     }
 
     #[test]
     fn api_sign_fails_closed_on_unusable_secrets() {
-        assert!(api_sign("", 1, "").is_none()); // decodes to zero bytes
-        assert!(api_sign("not base64!!", 1, "").is_none());
-        assert!(api_sign("Zg=", 1, "").is_none()); // malformed padding
+        // Decodes to zero bytes / not in the alphabet / malformed padding.
+        assert!(api_sign("/0/private/Balance", "", 1, "nonce=1").is_none());
+        assert!(api_sign("/0/private/Balance", "not base64!!", 1, "nonce=1").is_none());
+        assert!(api_sign("/0/private/Balance", "Zg=", 1, "nonce=1").is_none());
     }
 
     #[test]
-    fn mask_key_shows_at_most_six_characters() {
-        assert_eq!(mask_key("ABCDEFGHIJK"), "ABCDEF\u{2026}");
-        assert_eq!(mask_key("ABCDEF"), "\u{2026}"); // exactly six hides everything
-        assert_eq!(mask_key("AB"), "\u{2026}");
-        assert_eq!(mask_key(""), "\u{2026}");
-        // Unicode-safe: counts characters, not bytes.
-        assert_eq!(
-            mask_key("\u{e4}\u{f6}\u{fc}\u{df}\u{20ac}\u{a5}ABCDEF"),
-            "\u{e4}\u{f6}\u{fc}\u{df}\u{20ac}\u{a5}\u{2026}"
+    fn api_sign_request_bytes_is_a_post_carrying_the_signed_body() {
+        let bytes = api_sign_request_bytes("/0/private/Balance", "KEY", "SIGN", "nonce=42");
+        let text = String::from_utf8(bytes).expect("request bytes are ASCII");
+        assert!(
+            text.starts_with("POST /0/private/Balance HTTP/1.1\r\n"),
+            "{text}"
         );
+        assert!(text.contains("Content-Length: 8\r\n"), "{text}");
+        assert!(
+            text.contains("Content-Type: application/x-www-form-urlencoded\r\n"),
+            "{text}"
+        );
+        assert!(text.contains("API-Key: KEY\r\n"), "{text}");
+        assert!(text.contains("API-Sign: SIGN\r\n"), "{text}");
+        assert!(text.ends_with("\r\n\r\nnonce=42"), "{text}");
+    }
+
+    #[test]
+    fn next_nonce_ms_strictly_increases() {
+        let mut previous = next_nonce_ms();
+        for _ in 0..10_000 {
+            let next = next_nonce_ms();
+            assert!(next > previous, "{next} did not exceed {previous}");
+            previous = next;
+        }
     }
 
     #[test]

@@ -23,7 +23,7 @@ sources:
   - id: configsrc
     resource: /src/config.rs
     title: Live-session configuration keys and load_for_live validation
-generated: { by: pi-agent/qwen3.8-max, at: 2026-10-16T15:30:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-10-18T19:30:00Z }
 ---
 
 `price-action live` answers a different question from
@@ -63,8 +63,8 @@ any. When the source is Massive it exits `1` naming `massive_api_key` if no key
 resolves, because that feed is authenticated. A Kraken session needs no key for
 its public data; if the optional **read-only** pair
 (`PRICE_ACTION_KRAKEN_API_KEY` + `PRICE_ACTION_KRAKEN_PRIVATE_KEY`) is
-injected, startup first runs one signed balance check — success prints a masked
-OK line, failure prints a `WARNING` and the session continues on public data,
+injected, startup first runs one signed balance check — success prints an OK
+line carrying no key material, failure prints a `WARNING` and the session continues on public data,
 and exactly one half of the pair exits `1` (see
 [Kraken Market Data & Keys](kraken-market-data.md)). Otherwise a Kraken session
 fails only on its own settings (see below). A session runs until
