@@ -242,16 +242,18 @@ past the previous status line prints one snapshot row on stdout (a real line
 from a Kraken smoke run):
 
 ```text
-[2026-10-20T18:51:00Z] PAPER STATUS bars=1 last_close=82415.40 signal=Flat position=none closed_trades=0 realized=+0.00 cash=10000.00 equity=10000.00
+[2026-10-21T14:07:00Z] PAPER STATUS bars=1 skipped=0 last_close=83593.70 signal=Flat position=none closed_trades=0 realized=+0.00 cash=10000.00 equity=10000.00
 ```
 
-Bars consumed, the last close, the raw strategy signal, the open position
-(side + entry price; `none` when flat — a raw `Flat` signal always closes an
-open position, so `signal=Flat` and a held position never appear together),
-the closed-trade count with realized net P/L so far, and the account's
-cash/equity after the last bar (equal while flat) — every
-figure a subset of what the end-of-session report renders anyway, so the line
-discloses nothing new. The `PAPER` marker travels with the row so any snippet
+Bars consumed, entries **skipped for lack of funds** so far (the cumulative
+twin of the `SKIPPED ENTRY` line below — the mid-session answer when a
+session is signalling but not trading), the last close, the raw strategy
+signal, the open position (side + entry price; `none` when flat — a raw
+`Flat` signal always closes an open position, so `signal=Flat` and a held
+position never appear together), the closed-trade count with realized net P/L
+so far, and the account's cash/equity after the last bar (equal while flat) —
+every figure a subset of what the end-of-session report renders anyway, so
+the line discloses nothing new. The `PAPER` marker travels with the row so any snippet
 or forward of it says plainly that the money figures are simulated (the same
 stance as the `MOCK TRADE` lines and the report footer). The session's
 **first bar prints immediately** (no
@@ -260,6 +262,30 @@ clock: a stalled feed prints nothing stale, and an out-of-order bar cannot
 re-trigger a printed window. This is the mid-session answer to "how is it
 doing?" between daily summaries — the deployment in the cluster sets it to
 900 (15 minutes).[^livers]
+
+## Skipped-entry line (episode-gated)
+
+When the paper account cannot fund a signalled entry (required margin plus
+the entry fee exceed free funds — [Paper Trading Accounting]
+(paper-trading-accounting.md)), the live session prints one line at the start
+of each skip **episode** (a real line from a default-balance Kraken smoke
+run):
+
+```text
+[2026-10-21T14:08:00Z] SKIPPED ENTRY (insufficient funds): signal=Long need=83819.89 have=10000.00 — position stays flat (paper account)
+```
+
+`need` is the gate's own `margin + fee` — quoted from
+`BarOutcome::skipped_entry_cost`, never recomputed by the logger, so the line
+cannot disagree with the decision it explains — and `have` is the free funds
+after the bar. An episode is a maximal run of consecutively skipped bars:
+the account retries the unfunded entry on every bar the signal persists, but
+the line prints once per episode, not once per bar, so a signal that persists
+for hours does not spam the log. It is the live-session equivalent of
+replay's `(insufficient funds)` trace note, and the `PAPER STATUS` line's
+`skipped=` counter keeps the cumulative total. Together they make a
+non-trading session self-explanatory in `kubectl logs` instead of a silent
+`entries=0`.[^livers]
 
 ## Daily summaries
 
@@ -276,7 +302,10 @@ Entries are counted the way
 per **funded position opened** — so a reversal books an exit *and* an entry on
 that day, and an entry the account could not fund books neither. Counting the
 raw strategy signal instead would disagree with the report's own per-UTC-day
-table; the tests assert the two views reconcile.[^livers]
+table; the tests assert the two views reconcile. The skips are not silent in
+a live session: each one increments the `PAPER STATUS` line's `skipped=`
+counter and the first of a run prints the [`SKIPPED ENTRY` line](#skipped-entry-line-episode-gated)
+above.[^livers]
 
 Summaries go out over a bounded channel to a separate consumer task, so a slow
 or dead notifier can never stall the session. The binary prints each one to the
