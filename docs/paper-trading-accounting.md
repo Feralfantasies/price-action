@@ -28,9 +28,11 @@ would have cost or earned.[^accountingsrc]
 trades.** Both paths feed bars into one `ReplaySession`, so every rule below
 applies identically whether the bars came from a CSV file or from a WebSocket;
 that is exactly why re-replaying a session's persisted CSV reproduces it. A
-live session adds two things on top, without changing any pricing rule: a
-mock-trade log line per close (quantity, committed notional, per-side fees with
-the bps rate, gross/net P/L, running cash/equity) and a
+live session adds observability lines on top, without changing any pricing
+rule: a mock-trade log line per close (quantity, committed notional, per-side
+fees with the bps rate, gross/net P/L, running cash/equity), the episode-gated
+`SKIPPED ENTRY` line (with the `PAPER STATUS` line's cumulative `skipped=`
+counter when the status interval is set), and a
 [`DailySummary`](telegram-notifications.md) per closed UTC day.[^liversrc]
 
 All money is `f64` (validated finite upstream by configuration), shown at two
@@ -70,8 +72,15 @@ is rebuilt by re-replaying them rather than stored.
   `net = gross − (entry fee + exit fee)`; net is what every roll-up sums.
 - **Insufficient funds:** if `notional + entry fee > free funds`, the entry is
   **skipped** — the trace still prints the raw strategy signal with an
-  `(insufficient funds)` note and no position opens. A skipped reversal leaves
-  the old leg already exited at the same close, recorded as a closed trade.
+  `(insufficient funds)` note and no position opens. The gate's own
+  `margin + fee` figure leaves the account as `BarOutcome::skipped_entry_cost`
+  so loggers can quote the decision's numbers without re-deriving them — a
+  live session prints it in the episode-gated `SKIPPED ENTRY` line and the
+  `PAPER STATUS` line's `skipped=` counter keeps the cumulative total ([Live
+  Market-Data Session](live-market-data-session.md)) — and the finished
+  `ReplayReport` carries the cumulative count as `skipped_entries`. A skipped
+  reversal leaves the old leg already exited at the same close, recorded as a
+  closed trade.
 - **Equity mark:** after every bar, `equity = free funds + required margin +
   leveraged unrealized P/L at that bar's close`, the required margin being the
   capital committed at entry (`quantity × entry`):
@@ -169,4 +178,4 @@ a live session's totals are only as good as the data that arrived — read the
 
 [^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0), `trade_fee_bps` (unsigned bps) and `max_leverage` (integer `1..100`) in all three precedence layers with error-naming tests
 
-[^liversrc]: `src/live.rs`: `SessionState::new` (constructs the same `ReplaySession`/`PaperAccount`), `log_mock_trade`, `DayAccumulator::record` (entries counted as funded position openings, matching `per_day_totals`), and the reconciliation test asserting a live day's summary equals the report's per-UTC-day roll-up
+[^liversrc]: `src/live.rs`: `SessionState::new` (constructs the same `ReplaySession`/`PaperAccount`), `log_mock_trade`, the episode gate `SessionState::note_skip` + `format_skipped_entry_line`/`format_status_line` (the `skipped=` counter), `DayAccumulator::record` (entries counted as funded position openings, matching `per_day_totals`), and the reconciliation test asserting a live day's summary equals the report's per-UTC-day roll-up

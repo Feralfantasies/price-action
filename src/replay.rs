@@ -116,10 +116,18 @@ impl ReplaySession {
     }
 
     /// Snapshot of the currently open position, if any — for the live
-    /// session's periodic `STATUS` line.
+    /// session's periodic `PAPER STATUS` line.
     #[must_use]
     pub fn position_snapshot(&self) -> Option<PositionSnapshot> {
         self.account.position_snapshot()
+    }
+
+    /// Entries skipped so far for lack of funds (cumulative; the same count
+    /// the finished report carries as `skipped_entries`) — quoted by the live
+    /// session's `PAPER STATUS` line.
+    #[must_use]
+    pub const fn skipped_entries(&self) -> usize {
+        self.skipped_entries
     }
 
     /// Prices `bar` through the engine and paper account, appending its trace
@@ -647,6 +655,19 @@ mod tests {
         let report = replay_bars(&config, &bars).expect("replay");
         assert_eq!(report.entries, 1);
         assert!(matches!(report.final_signal, Signal::Short));
+    }
+
+    #[test]
+    fn session_exposes_the_skipped_entry_counter() {
+        // Threshold 1: the falling close signals Short on bar 2; one unit at
+        // 9.00 cannot be funded from a 1.00 balance.
+        let mut session = ReplaySession::new(1, 1.0, 5, 1, 1);
+        assert_eq!(session.skipped_entries(), 0);
+        let _ = session.on_bar(&bar(10.0, 0)).expect("first bar");
+        assert_eq!(session.skipped_entries(), 0);
+        let second = session.on_bar(&bar(9.0, 60)).expect("second bar");
+        assert!(second.outcome.entry_skipped);
+        assert_eq!(session.skipped_entries(), 1);
     }
 
     #[test]

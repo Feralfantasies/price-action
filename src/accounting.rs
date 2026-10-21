@@ -141,6 +141,11 @@ pub struct BarOutcome {
     /// True if this bar's desired entry was skipped for lack of funds — render
     /// as an `(insufficient funds)` note on the trace line.
     pub entry_skipped: bool,
+    /// When `entry_skipped`: the exact `margin + fee` the affordability gate
+    /// required and the account lacked — quoted from the decision itself so
+    /// consumers (the live `SKIPPED ENTRY` line) never recompute the formula.
+    /// `None` on every other bar.
+    pub skipped_entry_cost: Option<f64>,
     /// True if this bar's close forced a liquidation of the open position
     /// (maintenance margin breached) — render as a `[liquidated]` note.
     pub liquidated: bool,
@@ -313,6 +318,7 @@ impl PaperAccount {
         }
 
         let mut entry_skipped = false;
+        let mut skipped_entry_cost = None;
         if !self.is_open() && next != &Signal::Flat {
             // Capital committed is the required margin; the fee prices the
             // leveraged notional the position will control.
@@ -320,6 +326,7 @@ impl PaperAccount {
             let fee = margin * self.leverage * self.fee_rate;
             if margin + fee > self.available {
                 entry_skipped = true;
+                skipped_entry_cost = Some(margin + fee);
             } else {
                 self.apply_costs(margin, fee);
                 self.open_side = Some(match next {
@@ -354,6 +361,7 @@ impl PaperAccount {
             },
             effective_signal: self.held_signal(),
             entry_skipped,
+            skipped_entry_cost,
             liquidated,
         }
     }
@@ -597,6 +605,23 @@ mod tests {
     }
 
     const D_BASE: u64 = 1_725_458_400; // 2024-09-04 (UTC)
+
+    #[test]
+    fn skipped_entry_cost_quotes_the_gate() {
+        // 1 unit, 1.00 of funds, 5 bps fee, 1x: a 9.00 entry needs
+        // margin 9.00 + fee 0.0045 and is skipped.
+        let mut acc = PaperAccount::new(1, 1.0, 5, 1);
+        let out = acc.on_bar(&S::Long, 0, &bar(9.0, D_BASE));
+        assert!(out.entry_skipped);
+        near(out.skipped_entry_cost.unwrap_or(f64::NAN), 9.0045);
+        assert!(!out.liquidated);
+
+        // A funded entry carries no skip cost.
+        let mut funded = PaperAccount::new(1, 100.0, 5, 1);
+        let out = funded.on_bar(&S::Long, 0, &bar(9.0, D_BASE));
+        assert!(!out.entry_skipped);
+        assert_eq!(out.skipped_entry_cost, None);
+    }
 
     #[test]
     fn long_round_trip_net_of_fees() {
