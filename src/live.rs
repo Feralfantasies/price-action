@@ -931,10 +931,17 @@ fn status_due(last: Option<SystemTime>, now: SystemTime, interval_secs: u64) -> 
 /// accounting gate's own `margin + fee` (quoted from
 /// [`crate::accounting::BarOutcome::skipped_entry_cost`], never recomputed
 /// here, so the line cannot disagree with the decision it explains); `have`
-/// is the free funds after the bar.
+/// is the free funds after the bar. `shortfall` is the positive gap
+/// `need - have`, printed to four decimals — the gate compares the two at
+/// full `f64` precision, so a sub-cent rejection would otherwise print with
+/// `need` and `have` apparently equal and no visible reason. The gap is
+/// derived from the two figures already quoted, never from a re-derivation of
+/// the gate's `margin + fee` formula.
+#[allow(clippy::arithmetic_side_effects)] // bounded money math: the gate guarantees need > have
 fn format_skipped_entry_line(ts: SystemTime, signal: Signal, need: f64, have: f64) -> String {
+    let shortfall = need - have;
     format!(
-        "[{}] SKIPPED ENTRY (insufficient funds): signal={:?} need={need:.2} have={have:.2} — position stays flat (paper account)",
+        "[{}] SKIPPED ENTRY (insufficient funds): signal={:?} need={need:.2} have={have:.2} shortfall={shortfall:.4} — position stays flat (paper account)",
         utc_stamp(ts),
         signal,
     )
@@ -1151,7 +1158,24 @@ mod tests {
             line,
             format!(
                 "[{stamp}] SKIPPED ENTRY (insufficient funds): signal=Short \
-                 need=83464.69 have=10000.00 — position stays flat (paper account)"
+                 need=83464.69 have=10000.00 shortfall=73464.6900 — position stays flat (paper account)"
+            )
+        );
+    }
+
+    /// A rejection the two-decimal `need`/`have` figures cannot show: both
+    /// round to the same value, but the gate compared at full `f64` precision
+    /// — the positive `shortfall` must carry the reason.
+    #[test]
+    fn skipped_entry_line_keeps_a_sub_cent_shortfall_visible() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_500_000);
+        let line = format_skipped_entry_line(t0, Signal::Long, 10_000.004, 10_000.001);
+        let stamp = utc_stamp(t0);
+        assert_eq!(
+            line,
+            format!(
+                "[{stamp}] SKIPPED ENTRY (insufficient funds): signal=Long \
+                 need=10000.00 have=10000.00 shortfall=0.0030 — position stays flat (paper account)"
             )
         );
     }

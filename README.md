@@ -172,7 +172,9 @@ What you get:
   and realized P/L, cash/equity — so `kubectl logs` answers "how is it doing?"
   without waiting for midnight. Default `0` prints none. A session that signals
   but cannot fund its entries additionally prints an episode-gated
-  `SKIPPED ENTRY` line with the gate's own need/have amounts.
+  `SKIPPED ENTRY` line with the gate's own need/have amounts and the
+  positive shortfall between them (four decimals, so sub-cent rejections stay
+  visible).
 - **The full session report** on stop: the same per-bar trace, closed-trade
   table, per-UTC-day totals and session totals replay prints, with `live` as
   the source label.

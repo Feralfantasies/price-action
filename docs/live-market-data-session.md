@@ -272,13 +272,17 @@ of each skip **episode** (a real line from a default-balance Kraken smoke
 run):
 
 ```text
-[2026-10-21T14:08:00Z] SKIPPED ENTRY (insufficient funds): signal=Long need=83819.89 have=10000.00 — position stays flat (paper account)
+[2026-10-21T14:08:00Z] SKIPPED ENTRY (insufficient funds): signal=Long need=83819.89 have=10000.00 shortfall=73819.8900 — position stays flat (paper account)
 ```
 
 `need` is the gate's own `margin + fee` — quoted from
 `BarOutcome::skipped_entry_cost`, never recomputed by the logger, so the line
 cannot disagree with the decision it explains — and `have` is the free funds
-after the bar. An episode is a maximal run of consecutively skipped bars:
+after the bar. `shortfall` is the positive gap `need − have` printed to four
+decimals (not two): the gate compares the two at full `f64` precision, so a
+sub-cent rejection would otherwise print with `need` and `have` apparently
+equal and no visible reason. An episode is a maximal run of consecutively
+skipped bars:
 the account retries the unfunded entry on every bar the signal persists, but
 the line prints once per episode, not once per bar, so a signal that persists
 for hours does not spam the log. It is the live-session equivalent of
