@@ -168,9 +168,13 @@ What you get:
   balance).
 - **Periodic status snapshots** (opt-in): with `PRICE_ACTION_STATUS_INTERVAL_SECS`
   set (e.g. `900` for 15 minutes), one `PAPER STATUS` line prints per interval —
-  bars so far, last close, signal, open position, closed trades and realized
-  P/L, cash/equity — so `kubectl logs` answers "how is it doing?" without
-  waiting for midnight. Default `0` prints none.
+  bars so far, skipped entries, last close, signal, open position, closed trades
+  and realized P/L, cash/equity — so `kubectl logs` answers "how is it doing?"
+  without waiting for midnight. Default `0` prints none. A session that signals
+  but cannot fund its entries additionally prints an episode-gated
+  `SKIPPED ENTRY` line with the gate's own need/have amounts and the
+  positive shortfall between them (four decimals, so sub-cent rejections stay
+  visible).
 - **The full session report** on stop: the same per-bar trace, closed-trade
   table, per-UTC-day totals and session totals replay prints, with `live` as
   the source label.

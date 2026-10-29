@@ -95,10 +95,10 @@ live_feed_channel = "minute"
 live_csv_dir = "./sessions"
 
 # Periodic live PAPER STATUS snapshot lines: minimum seconds between one-line
-# stdout snapshots (bars, last close, signal, open position, closed trades +
-# realized P/L, cash/equity). 0 (default) = off. Live-session only; gated on
-# bar timestamps, so a stalled feed prints nothing. The cluster deployment
-# uses 900 (15 minutes).
+# stdout snapshots (bars, skipped entries, last close, signal, open position,
+# closed trades + realized P/L, cash/equity). 0 (default) = off.
+# Live-session only; gated on bar timestamps, so a stalled feed prints
+# nothing. The cluster deployment uses 900 (15 minutes).
 # status_interval_secs = 900
 
 # ---------------------------------------------------------------------------

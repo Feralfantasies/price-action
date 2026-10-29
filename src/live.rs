@@ -454,7 +454,11 @@ pub struct DailySummary {
     pub symbol: String,
     /// Bars consumed during the day.
     pub bars: usize,
-    /// Position entries signalled during the day (funded or not).
+    /// Position entries **funded** during the day. An entry the account
+    /// skipped for insufficient funds is NOT counted here — skips surface as
+    /// `SKIPPED ENTRY` log lines and the `PAPER STATUS` line's `skipped=`
+    /// counter instead. (The replay report's footer, by contrast, counts raw
+    /// signalled entries whether funded or not.)
     pub entries: usize,
     /// Paper trades that exited during the day.
     pub exits: usize,
@@ -623,6 +627,10 @@ struct SessionState {
     /// Bar timestamp of the last periodic `PAPER STATUS` line; `None` until
     /// the first one prints (the session's first bar always prints one).
     last_status: Option<SystemTime>,
+    /// True while an entry-skip episode is in progress: the account retries
+    /// the unfunded entry on every bar the signal persists, and the
+    /// `SKIPPED ENTRY` line prints once per episode, not once per bar.
+    skip_episode_active: bool,
     /// Running totals for the UTC day in progress.
     day: DayAccumulator,
 }
@@ -641,6 +649,7 @@ impl SessionState {
             last_close: None,
             pending_gap_note: None,
             last_status: None,
+            skip_episode_active: false,
             day: DayAccumulator::new(config.starting_balance),
         }
     }
@@ -679,6 +688,22 @@ impl SessionState {
             log_mock_trade(trade, bar.timestamp(), config, result.outcome.state);
         }
 
+        // A skipped entry must not be silent: replay renders `(insufficient
+        // funds)` on the trace line, but a live session prints no trace — so
+        // an unfunded session was indistinguishable from one that never
+        // signals (the BTC deployment's 322-bar "entries: 0" day). Printed
+        // once per skip episode; `need` quotes the accounting gate's own
+        // number, never a recomputation.
+        if self.note_skip(result.outcome.entry_skipped) {
+            let line = format_skipped_entry_line(
+                bar.timestamp(),
+                result.signal,
+                result.outcome.skipped_entry_cost.unwrap_or(0.0),
+                result.outcome.state.available,
+            );
+            println!("{line}");
+        }
+
         // Periodic PAPER STATUS snapshot (opt-in via `status_interval_secs`):
         // the mid-session answer to "how is it doing?" between daily
         // summaries. Gated on bar timestamps — session time, not wall clock —
@@ -694,6 +719,7 @@ impl SessionState {
             let line = format_status_line(
                 bar.timestamp(),
                 self.bars.len(),
+                self.session.skipped_entries(),
                 bar.close(),
                 result.signal,
                 self.session.position_snapshot(),
@@ -709,6 +735,20 @@ impl SessionState {
     /// session never saw a bar.
     fn finish_day(&mut self, symbol: &str) -> Option<DailySummary> {
         self.day.take(symbol, true)
+    }
+
+    /// Episode gate for the `SKIPPED ENTRY` line: returns true exactly on the
+    /// first skipped bar of an episode (a skip following non-skipped bars), so
+    /// a signal that persists for hours prints once, not once per bar.
+    const fn note_skip(&mut self, skipped: bool) -> bool {
+        if skipped {
+            let first_of_episode = !self.skip_episode_active;
+            self.skip_episode_active = true;
+            first_of_episode
+        } else {
+            self.skip_episode_active = false;
+            false
+        }
     }
 }
 
@@ -885,8 +925,31 @@ fn status_due(last: Option<SystemTime>, now: SystemTime, interval_secs: u64) -> 
     })
 }
 
+/// The `SKIPPED ENTRY` line: printed at the start of each skip episode when
+/// the paper account could not fund a signalled entry — the live-session
+/// equivalent of replay's `(insufficient funds)` trace note. `need` is the
+/// accounting gate's own `margin + fee` (quoted from
+/// [`crate::accounting::BarOutcome::skipped_entry_cost`], never recomputed
+/// here, so the line cannot disagree with the decision it explains); `have`
+/// is the free funds after the bar. `shortfall` is the positive gap
+/// `need - have`, printed to four decimals — the gate compares the two at
+/// full `f64` precision, so a sub-cent rejection would otherwise print with
+/// `need` and `have` apparently equal and no visible reason. The gap is
+/// derived from the two figures already quoted, never from a re-derivation of
+/// the gate's `margin + fee` formula.
+#[allow(clippy::arithmetic_side_effects)] // bounded money math: the gate guarantees need > have
+fn format_skipped_entry_line(ts: SystemTime, signal: Signal, need: f64, have: f64) -> String {
+    let shortfall = need - have;
+    format!(
+        "[{}] SKIPPED ENTRY (insufficient funds): signal={:?} need={need:.2} have={have:.2} shortfall={shortfall:.4} — position stays flat (paper account)",
+        utc_stamp(ts),
+        signal,
+    )
+}
+
 /// The periodic `PAPER STATUS` line: one snapshot row of a live session —
-/// bars consumed, the last close, the raw strategy signal, the open position
+/// bars consumed, entries skipped for lack of funds so far, the last close,
+/// the raw strategy signal, the open position
 /// (side + entry, `none` when flat), the closed-trade count with realized
 /// net P/L so far, and the account's cash/equity after the last bar. The
 /// `PAPER` marker travels with the row so any snippet or forward of it says
@@ -899,6 +962,7 @@ fn status_due(last: Option<SystemTime>, now: SystemTime, interval_secs: u64) -> 
 fn format_status_line(
     ts: SystemTime,
     bars: usize,
+    skipped: usize,
     last_close: f64,
     signal: Signal,
     position: Option<PositionSnapshot>,
@@ -915,9 +979,10 @@ fn format_status_line(
         None => "none".to_owned(),
     };
     format!(
-        "[{}] PAPER STATUS bars={} last_close={:.2} signal={:?} position={} closed_trades={} realized={:+.2} cash={:.2} equity={:.2}",
+        "[{}] PAPER STATUS bars={} skipped={} last_close={:.2} signal={:?} position={} closed_trades={} realized={:+.2} cash={:.2} equity={:.2}",
         utc_stamp(ts),
         bars,
+        skipped,
         last_close,
         signal,
         position_text,
@@ -1045,12 +1110,12 @@ mod tests {
             available: 10_000.00,
             equity: 10_000.00,
         };
-        let line = format_status_line(t0, 1, 82_566.20, Signal::Flat, None, &[], flat_state);
+        let line = format_status_line(t0, 1, 0, 82_566.20, Signal::Flat, None, &[], flat_state);
         let stamp = utc_stamp(t0);
         assert_eq!(
             line,
             format!(
-                "[{stamp}] PAPER STATUS bars=1 last_close=82566.20 signal=Flat \
+                "[{stamp}] PAPER STATUS bars=1 skipped=0 last_close=82566.20 signal=Flat \
                  position=none closed_trades=0 realized=+0.00 \
                  cash=10000.00 equity=10000.00"
             )
@@ -1065,6 +1130,7 @@ mod tests {
         let long_line = format_status_line(
             t0,
             5,
+            2,
             102.60,
             Signal::Long,
             Some(PositionSnapshot {
@@ -1080,6 +1146,48 @@ mod tests {
             "{long_line}"
         );
         assert!(long_line.contains("signal=Long"), "{long_line}");
+        assert!(long_line.contains("skipped=2"), "{long_line}");
+    }
+
+    #[test]
+    fn skipped_entry_line_quotes_the_gate_numbers() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_500_000);
+        let line = format_skipped_entry_line(t0, Signal::Short, 83_464.69, 10_000.00);
+        let stamp = utc_stamp(t0);
+        assert_eq!(
+            line,
+            format!(
+                "[{stamp}] SKIPPED ENTRY (insufficient funds): signal=Short \
+                 need=83464.69 have=10000.00 shortfall=73464.6900 — position stays flat (paper account)"
+            )
+        );
+    }
+
+    /// A rejection the two-decimal `need`/`have` figures cannot show: both
+    /// round to the same value, but the gate compared at full `f64` precision
+    /// — the positive `shortfall` must carry the reason.
+    #[test]
+    fn skipped_entry_line_keeps_a_sub_cent_shortfall_visible() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_791_500_000);
+        let line = format_skipped_entry_line(t0, Signal::Long, 10_000.004, 10_000.001);
+        let stamp = utc_stamp(t0);
+        assert_eq!(
+            line,
+            format!(
+                "[{stamp}] SKIPPED ENTRY (insufficient funds): signal=Long \
+                 need=10000.00 have=10000.00 shortfall=0.0030 — position stays flat (paper account)"
+            )
+        );
+    }
+
+    #[test]
+    fn skip_line_prints_once_per_episode() {
+        let mut state = SessionState::new(&Config::default());
+        assert!(state.note_skip(true)); // first skipped bar of an episode: print
+        assert!(!state.note_skip(true)); // persisting signal: stay quiet
+        assert!(!state.note_skip(true));
+        assert!(!state.note_skip(false)); // a non-skipped bar ends the episode
+        assert!(state.note_skip(true)); // the next episode prints again
     }
 
     /// A window with sane OHLC around `close`, one minute long, for `AAPL`.
