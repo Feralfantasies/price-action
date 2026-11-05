@@ -1,8 +1,8 @@
 ---
 type: Reference
 title: Paper Trading Accounting
-description: How the replay report — and the live session — price the strategy's decisions as a funded paper account: execution model, flat basis-point fees per side, insufficient-funds skipping, configurable leverage with required-margin tracking and forced liquidation, UTC-day bucketing and session roll-ups.
-tags: [replay, live, accounting, paper-trading, fees, leverage, margin, p/l]
+description: How the replay report — and the live session — price the strategy's decisions as a funded paper account: execution model, flat basis-point fees per side, insufficient-funds skipping, margin-based fractional position sizing (`max_position_pct`), configurable leverage with required-margin tracking and forced liquidation, UTC-day bucketing and session roll-ups.
+tags: [replay, live, accounting, paper-trading, fees, leverage, margin, sizing, p/l]
 status: draft
 sources:
   - id: accountingsrc
@@ -10,7 +10,7 @@ sources:
     title: Paper-account source (state machine, day math, hand-computed test vectors)
   - id: configsrc
     resource: /src/config.rs
-    title: Config knobs that feed the account (starting_balance, trade_fee_bps)
+    title: Config knobs that feed the account (starting_balance, trade_fee_bps, max_position_pct, max_leverage)
   - id: liversrc
     resource: /src/live.rs
     title: Live session source (same account, daily summaries)
@@ -29,7 +29,7 @@ trades.** Both paths feed bars into one `ReplaySession`, so every rule below
 applies identically whether the bars came from a CSV file or from a WebSocket;
 that is exactly why re-replaying a session's persisted CSV reproduces it. A
 live session adds observability lines on top, without changing any pricing
-rule: a mock-trade log line per close (quantity, committed notional, per-side
+rule: a mock-trade log line per close (units, committed notional, per-side
 fees with the bps rate, gross/net P/L, running cash/equity), the episode-gated
 `SKIPPED ENTRY` line (with the `PAPER STATUS` line's cumulative `skipped=`
 counter when the status interval is set), and a
@@ -43,11 +43,12 @@ the flat fee rate, and **no persistence of the account itself** — a live
 session persists its *bars* (so the run is reproducible), but the account state
 is rebuilt by re-replaying them rather than stored.
 
-## Three settings feed the account
+## Five settings feed the account
 
 | Setting (env / TOML) | Default | Meaning |
 |---|---|---|
-| `PRICE_ACTION_QUANTITY` / `quantity` | `1` | Units per position. Sizes every notional in the model — committed/collateralized funds, each leg's fee, cash/equity movements and P/L all scale with it, and affordability of an entry depends on it ([Configuration](configuration.md)). |
+| `PRICE_ACTION_QUANTITY` / `quantity` | `1` | Units per position **while the risk knob below is off** (the default). Sizes every notional in the model — committed/collateralized funds, each leg's fee, cash/equity movements and P/L all scale with it, and affordability of an entry depends on it ([Configuration](configuration.md)). Fractional values are legal on purpose; the value is ignored while `max_position_pct` is on. |
+| `PRICE_ACTION_MAX_POSITION_PCT` / `max_position_pct` | `0` | **Off** by default: entries size the fixed `quantity` above, exactly the historical model. Above 0 each entry commits that percentage of the account's **free funds** as required margin, converted to (fractional) units at the entry close — see the sizing rule below ([Configuration](configuration.md)). |
 | `PRICE_ACTION_STARTING_BALANCE` / `starting_balance` | `10000` | Free funds before the first trade; must be finite and strictly positive ([Configuration](configuration.md)). |
 | `PRICE_ACTION_TRADE_FEE_BPS` / `trade_fee_bps` | `5` | Fee per side of each paper trade, in **basis points** of that leg's notional: rate = `bps / 10_000`, so the default charges 0.05%. Zero disables fees exactly; negative values are rejected by config validation. |
 | `PRICE_ACTION_MAX_LEVERAGE` / `max_leverage` | `1` | Maximum leverage the paper account may put on a position: `1` = unleveraged, the documented default. Integer `1..100`; anything else is rejected naming `max_leverage`. Above 1 it multiplies the notional a position controls (and therefore its fees and P/L) **without** committing more capital — see the margin rules below ([Configuration](configuration.md)). |
@@ -59,18 +60,29 @@ is rebuilt by re-replaying them rather than stored.
   the position change**. That is precisely the bar the corresponding trace
   line annotates with `cash=`/`equity=`, so any reported figure can be derived
   from one line of output.[^accountingsrc]
-- **Notional & committed funds:** an entry sizes `quantity × close`. A long
-  pays that amount out of free funds (plus the entry fee); a short has it
-  **reserved as collateral** — its free funds drop by the same notional plus
-  fee, but that capital is tied up for the life of the position and returns
-  at exit.
+- **Position sizing (`max_position_pct`):** with the knob off (`0`, the
+  default) an entry sizes the fixed `quantity` units — the historical model.
+  With it on, an entry commits `max_position_pct / 100` of the account's free
+  funds as **required margin**, expressed in units at the entry close:
+  `units = max_position_pct / 100 × free funds ÷ close`, so the required
+  margin is `units × close` — that fraction of free funds by construction.
+  Units are **fractional on purpose**: a 100-unit account trading a ~700-unit
+  coin opens ~0.1 units, never a whole coin, which is what makes a small
+  starting balance fundable at all. `quantity` is ignored while the knob is
+  on.
+- **Notional & committed funds:** an entry sizes `units × close`, where `units`
+  is the size the entry actually put down (fixed `quantity`, or the fraction
+  the risk knob computed). A long pays that amount out of free funds (plus the
+  entry fee); a short has it **reserved as collateral** — its free funds drop
+  by the same notional plus fee, but that capital is tied up for the life of
+  the position and returns at exit.
 - **Exit:** releases the committed notional, credits signed gross P/L, then
   charges the exit fee on the *exit* bar's notional:
-  - long: `gross = (exit − entry) × quantity`
-  - short: `gross = (entry − exit) × quantity`
+  - long: `gross = (exit − entry) × units`
+  - short: `gross = (entry − exit) × units`
 
   `net = gross − (entry fee + exit fee)`; net is what every roll-up sums.
-- **Insufficient funds:** if `notional + entry fee > free funds`, the entry is
+- **Insufficient funds:** if `required margin + entry fee > free funds`, the entry is
   **skipped** — the trace still prints the raw strategy signal with an
   `(insufficient funds)` note and no position opens. The gate's own
   `margin + fee` figure leaves the account as `BarOutcome::skipped_entry_cost`
@@ -83,13 +95,13 @@ is rebuilt by re-replaying them rather than stored.
   closed trade.
 - **Equity mark:** after every bar, `equity = free funds + required margin +
   leveraged unrealized P/L at that bar's close`, the required margin being the
-  capital committed at entry (`quantity × entry`):
-  - long: `free + quantity × entry + (close − entry) × quantity × max_leverage`
-  - short: `free + quantity × entry + (entry − close) × quantity × max_leverage`
+  capital committed at entry (`units × entry`):
+  - long: `free + units × entry + (close − entry) × units × max_leverage`
+  - short: `free + units × entry + (entry − close) × units × max_leverage`
 
   At `max_leverage = 1` these reduce exactly to the historical marks — shares
-  valued at the close (`quantity × close`) for longs, and collateral plus
-  unrealized `(entry − close) × quantity` for shorts. While
+  valued at the close (`units × close`) for longs, and collateral plus
+  unrealized `(entry − close) × units` for shorts. While
   flat, equity equals free funds; the session total marks its final bar at
   the file's last close. Per the insolvency policy below this value floors
   at 0.
@@ -105,15 +117,15 @@ is rebuilt by re-replaying them rather than stored.
   liquidation cascade or stop-loss** on top of this floor at 1x: it *is* the
   whole insolvency model; the leveraged forced-liquidation test below is the
   only addition, and it never applies to an unleveraged run.
-- **Leverage (`max_leverage` > 1):** a position controls `quantity × leverage`
+- **Leverage (`max_leverage` > 1):** a position controls `units × leverage`
   units of the instrument, so its **exposure** — the notional fees and P/L are
-  priced on — is `quantity × leverage × close`, while the capital it actually
-  commits is the **required margin** `quantity × close`. Leverage buys exposure
+  priced on — is `units × leverage × close`, while the capital it actually
+  commits is the **required margin** `units × close`. Leverage buys exposure
   per unit of capital, it does not buy more capital, which is why sizing up is
   what leverage is for in reality. Both legs' fees price the leveraged notional
   and gross P/L scales by `leverage`:
-  - long: `gross = (exit − entry) × quantity × leverage`
-  - short: `gross = (entry − exit) × quantity × leverage`
+  - long: `gross = (exit − entry) × units × leverage`
+  - short: `gross = (entry − exit) × units × leverage`
   An entry is still skipped when `required margin + entry fee > free funds`,
   so a run can be fundable at 1x and skipped at 5x on the same bar.
 - **Forced liquidation (leveraged runs only):** before any strategy decision
@@ -137,7 +149,10 @@ shape in [Replay Workflow](replay-workflow.md)):[^accountingsrc]
   leveraged run (`max_leverage` > 1) adds three columns — `required margin`,
   `exposure` and `liquidated` — so a 1x and a leveraged report over identical
   bars are visibly different; an unleveraged run prints the historical table
-  shape exactly.
+  shape exactly. A margin-sized run (`max_position_pct` > 0) additionally adds a
+  `units` column spelling out the fractional size each entry actually put down,
+  and a `position sizing` header line naming the fraction (with `quantity`
+  marked ignored); a knob-off report is byte-identical to the historical shape.
 - **Totals per UTC day (24h)** — ISO `YYYY-MM-DD` calendar days; a day appears
   when it saw at least one entry *or* exit, and its net column only includes
   trades that **exited** that day (a trade open across midnight books to both
@@ -158,8 +173,9 @@ shape in [Replay Workflow](replay-workflow.md)):[^accountingsrc]
 
 This is a teaching-grade cost model for reviewing settings, not a broker
 simulation: fills are always at the bar close (no intrabar slippage or
-partial fills), position sizing is the fixed `quantity` scaled by the
-configured `max_leverage` (no pyramiding, trailing stops or stop-losses), fees
+partial fills), position sizing is either the fixed `quantity` or the flat
+`max_position_pct` fraction of free funds, scaled by the configured
+`max_leverage` (no pyramiding, trailing stops or stop-losses), fees
 ignore venue minimums/tiers, and no account state is written to disk. The one
 margining rule that *does* exist is the forced-liquidation test above, whose
 maintenance margin is the position's required margin — Kraken's real rule is
@@ -176,6 +192,6 @@ a live session's totals are only as good as the data that arrived — read the
 
 [^accountingsrc]: `src/accounting.rs`: state machine in `PaperAccount::on_bar`, `exit_position`, equity mark, day arithmetic, and the test module with hand-computed reference values (long/short round trips, reversal, zero-fee exactness, insufficient-funds path, known UTC dates)
 
-[^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0), `trade_fee_bps` (unsigned bps) and `max_leverage` (integer `1..100`) in all three precedence layers with error-naming tests
+[^configsrc]: `src/config.rs`: `starting_balance` (finite, > 0), `trade_fee_bps` (unsigned bps), `max_position_pct` (finite, `0..100`, `0` = off) and `max_leverage` (integer `1..100`) in all three precedence layers with error-naming tests
 
 [^liversrc]: `src/live.rs`: `SessionState::new` (constructs the same `ReplaySession`/`PaperAccount`), `log_mock_trade`, the episode gate `SessionState::note_skip` + `format_skipped_entry_line`/`format_status_line` (the `skipped=` counter), `DayAccumulator::record` (entries counted as funded position openings, matching `per_day_totals`), and the reconciliation test asserting a live day's summary equals the report's per-UTC-day roll-up

@@ -104,8 +104,22 @@ pub fn parse_feed_source(raw: &str) -> Result<FeedSource, ConfigError> {
 pub struct Config {
     /// Instrument symbol to trade, e.g. `AAPL`.
     pub symbol: String,
-    /// Shares/contracts per trade. Must be at least 1.
-    pub quantity: u32,
+    /// Units per position, used when [`Config::max_position_pct`] is off (the
+    /// default sizing mode). **Fractional values are legal on purpose**: a
+    /// paper account funded with 100 units of a coin that costs 700 per unit
+    /// must still be able to open a position, so a position never has to be a
+    /// whole coin. The only rules are finiteness and positivity.
+    pub quantity: f64,
+    /// Aggressiveness knob: the percentage of the account's **free funds** an
+    /// entry commits as required margin. `0` — the default — means *off*: every
+    /// entry sizes the fixed [`Config::quantity`] units, exactly the historical
+    /// model. Above 0, each entry sizes `max_position_pct / 100` of free funds
+    /// as margin, divided by the entry close to get (fractional) units, so
+    /// sizing scales with the account instead of with a whole coin; the
+    /// affordability gate (margin plus entry fee over free funds) still applies
+    /// and still skips an unfunded entry. See the margin model in
+    /// `accounting`.
+    pub max_position_pct: f64,
     /// Paper (simulated) or live trading. Defaults to paper.
     pub mode: Mode,
     /// Bar interval in seconds. Must be at least 1.
@@ -214,7 +228,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             symbol: "AAPL".to_string(),
-            quantity: 1,
+            quantity: 1.0,
             mode: Mode::default(),
             bar_interval_secs: 60,
             status_interval_secs: 0,
@@ -223,6 +237,7 @@ impl Default for Config {
             starting_balance: 10_000.0,
             trade_fee_bps: 5,
             max_leverage: 1,
+            max_position_pct: 0.0,
             broker_url: None,
             broker_api_key: None,
             live_feed_host: "socket.massive.com".to_string(),
@@ -244,7 +259,7 @@ impl Default for Config {
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     symbol: Option<String>,
-    quantity: Option<u32>,
+    quantity: Option<f64>,
     mode: Option<String>,
     bar_interval_secs: Option<u64>,
     status_interval_secs: Option<u64>,
@@ -253,6 +268,7 @@ struct FileConfig {
     starting_balance: Option<f64>,
     trade_fee_bps: Option<u32>,
     max_leverage: Option<u32>,
+    max_position_pct: Option<f64>,
     broker_url: Option<String>,
     broker_api_key: Option<String>,
     live_feed_host: Option<String>,
@@ -407,6 +423,9 @@ impl Config {
         if let Some(v) = file.max_leverage {
             self.max_leverage = v;
         }
+        if let Some(v) = file.max_position_pct {
+            self.max_position_pct = v;
+        }
         if let Some(v) = file.broker_url {
             self.broker_url = Some(v);
         }
@@ -453,6 +472,7 @@ impl Config {
         env_override(env, "STARTING_BALANCE", &mut self.starting_balance)?;
         env_override(env, "TRADE_FEE_BPS", &mut self.trade_fee_bps)?;
         env_override(env, "MAX_LEVERAGE", &mut self.max_leverage)?;
+        env_override(env, "MAX_POSITION_PCT", &mut self.max_position_pct)?;
 
         if let Some(raw) = env("PRICE_ACTION_MODE") {
             self.mode = Mode::parse(&raw)
@@ -503,10 +523,13 @@ impl Config {
         if self.symbol.trim().is_empty() {
             return Err(ConfigError::invalid("symbol", "must not be empty".into()));
         }
-        if self.quantity == 0 {
+        // Fractional units are legal on purpose (see the field docs), so the
+        // only rules are finiteness and positivity — `f64`'s `FromStr` accepts
+        // `inf`/`NaN`, hence the explicit finiteness check.
+        if !self.quantity.is_finite() || self.quantity <= 0.0 {
             return Err(ConfigError::invalid(
                 "quantity",
-                "must be at least 1".into(),
+                "must be a finite value greater than 0 (fractional units are allowed)".into(),
             ));
         }
         if self.bar_interval_secs == 0 {
@@ -543,6 +566,19 @@ impl Config {
             return Err(ConfigError::invalid(
                 "max_leverage",
                 "must be between 1 and 100 (1 = unleveraged)".into(),
+            ));
+        }
+        // The risk knob is a percentage of free funds: `0` is the documented
+        // "off" value (fixed `quantity` sizing), above 100 would commit more
+        // than the account holds, and a non-finite value would poison every
+        // subsequent money figure.
+        if !self.max_position_pct.is_finite()
+            || self.max_position_pct < 0.0
+            || self.max_position_pct > 100.0
+        {
+            return Err(ConfigError::invalid(
+                "max_position_pct",
+                "must be between 0 (off: fixed quantity sizing) and 100".into(),
             ));
         }
         // The feed host is a bare hostname (no scheme, path, whitespace, or
@@ -651,6 +687,7 @@ impl fmt::Debug for Config {
             .field("starting_balance", &self.starting_balance)
             .field("trade_fee_bps", &self.trade_fee_bps)
             .field("max_leverage", &self.max_leverage)
+            .field("max_position_pct", &self.max_position_pct)
             .field("broker_url", &self.broker_url)
             .field(
                 "broker_api_key",
@@ -781,6 +818,12 @@ mod tests {
         std::env::temp_dir().join("price-action-config-test-missing.toml")
     }
 
+    /// Float equality for settings whose values are chosen exactly (the
+    /// layering tests never compute a value, they only move one through).
+    fn near(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+    }
+
     #[test]
     fn defaults_apply_with_no_file_no_env() {
         let cfg = Config::load_from(&no_file(), &env_from(BTreeMap::new())).unwrap();
@@ -821,7 +864,7 @@ bar_interval_secs = 300
         );
         let cfg = Config::load_from(&path, &env_from(BTreeMap::new())).unwrap();
         assert_eq!(cfg.symbol, "MSFT");
-        assert_eq!(cfg.quantity, 10);
+        near(cfg.quantity, 10.0);
         assert_eq!(cfg.bar_interval_secs, 300);
         // untouched fields keep their defaults
         assert_eq!(cfg.series_capacity, Config::default().series_capacity);
@@ -837,7 +880,7 @@ bar_interval_secs = 300
         ]));
         let cfg = Config::load_from(&path, &env).unwrap();
         assert_eq!(cfg.symbol, "NVDA"); // env wins over file
-        assert_eq!(cfg.quantity, 10); // file wins over default
+        near(cfg.quantity, 10.0); // file wins over default
         std::fs::remove_file(&path).ok();
     }
 
@@ -911,6 +954,53 @@ bar_interval_secs = 300
         assert_eq!(cfg.trade_fee_bps, 10);
         assert_eq!(cfg.max_leverage, 3); // file beats default
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn max_position_pct_defaults_off_and_layers_file_and_env() {
+        // Off by default: the historical fixed-quantity model is untouched.
+        near(Config::default().max_position_pct, 0.0);
+
+        let path = write_temp_config("quantity = 0.05\nmax_position_pct = 20\n");
+        let cfg = Config::load_from(&path, &env_from(BTreeMap::new())).unwrap();
+        near(cfg.quantity, 0.05); // fractional units are legal
+        near(cfg.max_position_pct, 20.0); // file beats default
+
+        let env = env_from(BTreeMap::from([("PRICE_ACTION_MAX_POSITION_PCT", "80")]));
+        let cfg = Config::load_from(&path, &env).unwrap();
+        near(cfg.max_position_pct, 80.0); // env beats file
+        near(cfg.quantity, 0.05); // file still beats default
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn max_position_pct_outside_its_range_is_rejected() {
+        for raw in ["-1", "101", "inf", "NaN"] {
+            let env = env_from(BTreeMap::from([("PRICE_ACTION_MAX_POSITION_PCT", raw)]));
+            let err = Config::load_from(&no_file(), &env).unwrap_err();
+            assert!(
+                err.to_string().contains("max_position_pct"),
+                "for {raw}: {err}"
+            );
+        }
+        // `0` is the documented "off" value, not an error.
+        let env = env_from(BTreeMap::from([("PRICE_ACTION_MAX_POSITION_PCT", "0")]));
+        assert!(Config::load_from(&no_file(), &env).is_ok());
+    }
+
+    #[test]
+    fn fractional_quantity_is_accepted_and_non_positive_or_non_finite_is_rejected() {
+        // A sub-coin position is the whole point of the knob: a 100-unit
+        // account trading a 700-unit coin opens 0.1 units, never a whole coin.
+        let env = env_from(BTreeMap::from([("PRICE_ACTION_QUANTITY", "0.05")]));
+        let cfg = Config::load_from(&no_file(), &env).unwrap();
+        near(cfg.quantity, 0.05);
+
+        for raw in ["0", "-1", "inf", "NaN"] {
+            let env = env_from(BTreeMap::from([("PRICE_ACTION_QUANTITY", raw)]));
+            let err = Config::load_from(&no_file(), &env).unwrap_err();
+            assert!(err.to_string().contains("quantity"), "for {raw}: {err}");
+        }
     }
 
     #[test]

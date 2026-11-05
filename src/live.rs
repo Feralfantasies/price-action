@@ -643,6 +643,7 @@ impl SessionState {
                 config.starting_balance,
                 config.trade_fee_bps,
                 config.max_leverage,
+                config.max_position_pct,
                 config.consecutive_closes_threshold,
             ),
             bars: Vec::new(),
@@ -999,12 +1000,22 @@ fn format_status_line(
 /// leveraged position outgrew its maintenance margin carries a
 /// `[liquidated]` marker, and a leveraged session marks its size as
 /// `x<quantity> @<leverage>x` so its lines are distinguishable from 1x — the
-/// 1x line keeps the historical, documented shape byte-for-byte.
+/// 1x line keeps the historical, documented shape byte-for-byte. A margin-sized
+/// session (`max_position_pct` > 0) prints the fractional `units` the entry
+/// actually put down in place of that `quantity`, which such a run ignores.
 fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, state: BarState) {
     let leverage_note = if config.max_leverage > 1 {
         format!(" @{}x", config.max_leverage)
     } else {
         String::new()
+    };
+    // A sized run ignored `quantity` when it opened the position, so quoting it
+    // here would name a size the trade never took; print the trade's own
+    // units instead. Knob-off runs keep the historical rendering.
+    let size_note = if config.max_position_pct > 0.0 {
+        format!("{:.4}", trade.units)
+    } else {
+        format!("{}", config.quantity)
     };
     println!(
         "[{}] MOCK TRADE #{}{} {} {} x{}{} entry={} ({}) -> exit={} ({}) | \
@@ -1019,7 +1030,7 @@ fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, stat
         },
         if trade.side_is_long { "LONG " } else { "SHORT" },
         config.symbol,
-        config.quantity,
+        size_note,
         leverage_note,
         trade.entry_price,
         trade.entry_day,

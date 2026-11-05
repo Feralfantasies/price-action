@@ -226,11 +226,14 @@ closes, on stdout:
 ```
 
 That is the "how much it would have put down, including fees" answer in real
-time: symbol and side, the configured `quantity`, entry and exit prices with
+time: symbol and side, the size the entry actually put down — `x<quantity>` in
+the default fixed-quantity model, or `x<units>` to four decimals (e.g. `x0.0729`)
+when the `max_position_pct` risk knob sizes the entry fractionally, in which
+case the configured `quantity` is ignored — entry and exit prices with
 their UTC days, the notional **committed**, the **fees** with the bps rate that
 produced them, gross and net P/L, and the account's **cash/equity** right after
 the bar. A leveraged session (`max_leverage > 1`) marks its size as
-`x<quantity> @<leverage>x` and a force-closed trade carries `[liquidated]`,
+`x<size> @<leverage>x` and a force-closed trade carries `[liquidated]`,
 so its lines are distinguishable from an unleveraged run — whose shape above
 is unchanged.[^livers]
 

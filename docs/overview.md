@@ -70,12 +70,23 @@ all feed the SAME engine + strategy + funded paper account
   feeds are data-in only and cannot place an order; even the optional
   read-only Kraken API-key pair can only read one balance endpoint.
 - **"Live" describes the data, never the execution.** A live session trades a
-  funded fake balance, logs each mock trade with its size, committed notional,
+  funded fake balance, logs each mock trade with its size (fractional `units`
+  when the `max_position_pct` risk knob sizes entries), committed notional,
   per-side fees and running cash/equity, persists its bars as a
   replay-compatible CSV, and summarizes each closed UTC day (optionally to
   Telegram, see [Telegram Notifications](telegram-notifications.md)). Nothing
   it reports is a track record or a recommendation — see
   [Disclaimer & Risk](disclaimer-risk.md).
+- **Position sizing has two aggressiveness knobs, and neither buys capital.**
+  `max_position_pct` (default `0` = off) sizes each entry as a percentage of the
+  account's **free funds** — `units = pct/100 × free funds ÷ close`, **fractional**
+  on purpose, so a 100-unit account trading a ~700-unit coin opens ~0.1 units and
+  every tier stays fundable; `max_leverage` (default `1`, integer `1..100`)
+  multiplies that position's **exposure** without committing more capital. With
+  the risk knob off, entries size the fixed `quantity` (also a positive `f64`, so
+  sub-unit positions are legal). The insufficient-funds gate (`required margin +
+  entry fee > free funds`) still skips unfunded entries on every path. See
+  [Paper Trading Accounting](paper-trading-accounting.md).
 - The [sample bar file](sample-bars.md) is **synthetic**: it is shaped like
   real trades but is *not* actual exchange prices. A live session's bars *are*
   real market data, but the money attached to them is not. This project is for
