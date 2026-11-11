@@ -1013,7 +1013,7 @@ fn log_mock_trade(trade: &ClosedTrade, bar_ts: SystemTime, config: &Config, stat
     // here would name a size the trade never took; print the trade's own
     // units instead. Knob-off runs keep the historical rendering.
     let size_note = if config.max_position_pct > 0.0 {
-        format!("{:.4}", trade.units)
+        crate::replay::units_str(trade.units)
     } else {
         format!("{}", config.quantity)
     };

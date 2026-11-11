@@ -315,12 +315,13 @@ impl PaperAccount {
     ///   required margin, expressed in fractional units (`units = pct / 100 ×
     ///   free funds ÷ close`, `margin = units × close`); with the knob off it
     ///   sizes the fixed `quantity` units, the historical model. Entering costs
-    ///   that margin plus its entry fee. When that exceeds available funds the
-    ///   entry is **skipped** (the bar effectively stays flat; after a reversal
-    ///   the old leg's exit stands and no new position opens) — the account
-    ///   never reports negative funds. Affordability compares the **required
-    ///   margin** plus the fee on the leveraged notional: leverage buys
-    ///   exposure, not capital.
+    ///   that margin plus its entry fee. An entry is **skipped** when the
+    ///   bar's close is non-positive (nothing can be sized or priced at it)
+    ///   or when that margin plus fee exceeds available funds (the bar
+    ///   effectively stays flat; after a reversal the old leg's exit stands
+    ///   and no new position opens) — the account never reports negative
+    ///   funds. Affordability compares the **required margin** plus the fee on
+    ///   the leveraged notional: leverage buys exposure, not capital.
     /// - The outcome carries post-bar funds/equity (any still-open position is
     ///   marked at this close), the effective signal, and a skip flag for trace
     ///   notes. This account tracks its own held position, so transitions
@@ -345,29 +346,40 @@ impl PaperAccount {
         let mut entry_skipped = false;
         let mut skipped_entry_cost = None;
         if !self.is_open() && next != &Signal::Flat {
-            // Size the entry first (risk fraction of free funds, or the fixed
-            // quantity when the knob is off), then price its fee on the
-            // leveraged notional the position will control.
-            let (units, margin) = self.size_entry(close);
-            let fee = margin * self.leverage * self.fee_rate;
-            if margin + fee > self.available {
+            // A non-positive close cannot price an entry: the risk fraction
+            // would divide by it (non-finite units) and the fixed quantity
+            // would price zero notional — so skip before any sizing math.
+            if close <= 0.0 {
                 entry_skipped = true;
-                skipped_entry_cost = Some(margin + fee);
             } else {
-                self.apply_costs(margin, fee);
-                self.open_side = Some(match next {
-                    Signal::Long => Side::Long,
-                    _ => Side::Short,
-                });
-                self.entry_price = close;
-                self.entry_quantity = units;
-                self.entry_notional = margin;
-                self.entry_fee = fee;
-                self.required_margin = margin;
-                self.peak_required_margin = self.peak_required_margin.max(margin);
-                self.entry_bar_index = bar_index;
-                self.entry_ts_secs = ts_secs;
-                self.entry_day = utc_day(ts_secs);
+                // Size the entry first (risk fraction of free funds, or the
+                // fixed quantity when the knob is off), then price its fee on
+                // the leveraged notional the position will control.
+                let (units, margin) = self.size_entry(close);
+                let fee = margin * self.leverage * self.fee_rate;
+                // A non-positive margin is an entry the account cannot hold
+                // (a fixed quantity priced at a zero close, or nothing left to
+                // size); skip it like an unfunded entry, before any state
+                // changes.
+                if margin <= 0.0 || margin + fee > self.available {
+                    entry_skipped = true;
+                    skipped_entry_cost = Some(margin + fee);
+                } else {
+                    self.apply_costs(margin, fee);
+                    self.open_side = Some(match next {
+                        Signal::Long => Side::Long,
+                        _ => Side::Short,
+                    });
+                    self.entry_price = close;
+                    self.entry_quantity = units;
+                    self.entry_notional = margin;
+                    self.entry_fee = fee;
+                    self.required_margin = margin;
+                    self.peak_required_margin = self.peak_required_margin.max(margin);
+                    self.entry_bar_index = bar_index;
+                    self.entry_ts_secs = ts_secs;
+                    self.entry_day = utc_day(ts_secs);
+                }
             }
         }
 
@@ -578,8 +590,12 @@ impl PaperAccount {
     /// 100-unit account trading a ~700-unit coin opens ~0.1 units, never a
     /// whole coin, and the same rule funds a £100 or €100 start unchanged.
     /// With the knob off (`0`, the default) the entry sizes the fixed `quantity`
-    /// units — the historical model, byte-for-byte. `close` is positive by
-    /// [`Bar`] validation, so the division is finite.
+    /// units — the historical model, byte-for-byte.
+    ///
+    /// Callers gate on a positive `close` before sizing (a non-positive close
+    /// can neither be divided by nor price a fixed quantity), and the margin
+    /// returned here is checked against the account before any state changes;
+    /// with a positive `close` the division is finite.
     #[allow(clippy::arithmetic_side_effects)] // bounded money math
     #[must_use]
     fn size_entry(&self, close: f64) -> (f64, f64) {
@@ -1033,6 +1049,43 @@ mod tests {
         near(out.skipped_entry_cost.unwrap_or(f64::NAN), 100.5);
         near(out.state.available, 100.0); // nothing committed
         assert_eq!(out.effective_signal, S::Flat);
+    }
+
+    #[test]
+    fn margin_sizing_skips_an_entry_at_a_nonpositive_close() {
+        // A zero close cannot be sized: the fraction would divide by it and
+        // produce non-finite units/margin. The entry is skipped before any
+        // sizing math — no position, no NaN, nothing committed.
+        let mut acc = PaperAccount::new(1.0, 100.0, 5, 1, 20.0);
+        let out = acc.on_bar(&S::Long, 0, &bar(0.0, D_BASE));
+        assert!(out.entry_skipped);
+        assert_eq!(out.skipped_entry_cost, None); // no cost was computable
+        assert_eq!(out.effective_signal, S::Flat);
+        assert!(out.state.available.is_finite());
+        assert!(out.state.equity.is_finite());
+        near(out.state.available, 100.0); // nothing committed
+        assert_eq!(acc.closed_trades().len(), 0);
+        // A later positive close still trades normally.
+        let out = acc.on_bar(&S::Long, 1, &bar(10.0, D_BASE));
+        assert!(!out.entry_skipped);
+    }
+
+    #[test]
+    fn fixed_quantity_skips_an_entry_at_a_zero_close() {
+        // Knob off: a fixed quantity at a zero close prices zero notional —
+        // a non-positive margin the account cannot hold. Skipped like an
+        // unfunded entry, before any state changes.
+        let mut acc = PaperAccount::new(1.0, 100.0, 5, 1, 0.0);
+        let out = acc.on_bar(&S::Short, 0, &bar(0.0, D_BASE));
+        assert!(out.entry_skipped);
+        assert_eq!(out.skipped_entry_cost, None); // skipped before any sizing
+        assert_eq!(out.effective_signal, S::Flat);
+        near(out.state.available, 100.0); // nothing committed
+        assert_eq!(acc.closed_trades().len(), 0);
+        // A positive close still takes the fixed-quantity model byte-for-byte.
+        let out = acc.on_bar(&S::Long, 1, &bar(9.0, D_BASE));
+        assert!(!out.entry_skipped);
+        near(out.state.available, 90.9955); // 100 - 9 margin - 0.0045 fee
     }
 
     #[test]
