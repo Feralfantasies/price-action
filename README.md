@@ -158,7 +158,9 @@ PRICE_ACTION_BAR_INTERVAL_SECS=60 \
 
 What you get:
 
-- **Per-trade, in real time**: side, the configured `quantity`, entry/exit
+- **Per-trade, in real time**: side, the size the entry actually put down (the
+  configured `quantity`, or the fractional `units` the `max_position_pct` risk
+  knob sized — printed to four decimals, e.g. `x0.0729`), entry/exit
   prices with their UTC days, the notional **committed**, the **fees** with the
   bps rate that produced them, gross and net P/L, and the running
   **cash/equity**.
@@ -386,6 +388,7 @@ override the config file, which overrides compiled defaults**:
 |---|---|---|---|
 | Instrument symbol | `PRICE_ACTION_SYMBOL` | `symbol` | `AAPL` |
 | Quantity per trade | `PRICE_ACTION_QUANTITY` | `quantity` | `1` |
+| Max position size (% of free funds) | `PRICE_ACTION_MAX_POSITION_PCT` | `max_position_pct` | `0` (off) |
 | Trading mode | `PRICE_ACTION_MODE` | `mode` | `paper` |
 | Bar interval (secs) | `PRICE_ACTION_BAR_INTERVAL_SECS` | `bar_interval_secs` | `60` |
 | Rolling-window size | `PRICE_ACTION_SERIES_CAPACITY` | `series_capacity` | `500` |
@@ -430,6 +433,14 @@ numbers — every bar's notional (and thus committed funds, fees, cash/equity,
 together with each trade's P/L) scales or is priced by them; a starting
 balance that cannot cover an entry turns it into an `(insufficient funds)`
 skip instead. That is why the Step 3 examples toggle threshold and balance.
+
+Two knobs set **how big a position is**, and both are aggressiveness knobs:
+`MAX_POSITION_PCT` (default `0` = off) sizes each entry as a percentage of the
+account's free funds — `units = pct/100 × free funds ÷ close`, **fractional**,
+so a 100-unit account trading a ~700-unit coin opens ~0.1 units and stays
+fundable — and `MAX_LEVERAGE` (default `1`) multiplies that position's exposure
+without committing more capital. With `MAX_POSITION_PCT` on, `QUANTITY` is
+ignored. See [Paper Trading Accounting](docs/paper-trading-accounting.md).
 
 ## Container deployment
 

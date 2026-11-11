@@ -7,7 +7,10 @@
 # Instrument to trade.
 symbol = "AAPL"
 
-# Shares/contracts per trade (>= 1).
+# Units per position when the risk knob below is off (the default sizing mode).
+# Fractional values are LEGAL ON PURPOSE — a paper position never has to be a
+# whole coin, so `0.05` of a coin is as valid as `1`. Must be a finite value
+# greater than 0.
 quantity = 1
 
 # "paper" (simulated, default) or "live" (requires broker_url; live EXECUTION
@@ -41,6 +44,19 @@ trade_fee_bps = 5
 # close. Leveraged runs print extra report columns and totals rows; 1x output
 # is unchanged. See docs/paper-trading-accounting.md.
 max_leverage = 1
+
+# Aggressiveness knob: the percentage of the account's FREE FUNDS an entry
+# commits as required margin (0 = off, the default: size the fixed `quantity`
+# units above, exactly the historical model). Above 0 each entry sizes
+# `max_position_pct / 100 × free funds ÷ close` UNITS — fractional, so a 100
+# unit account trading a ~700-unit coin opens ~0.1 units and every tier stays
+# fundable. Must be between 0 and 100; the affordability gate (`required
+# margin + entry fee > free funds`) still applies and still skips an unfunded
+# entry. Pair it with max_leverage for the aggressiveness ladder: the fraction
+# sizes the position, the multiplier prices its exposure. Sized runs print a
+# `position sizing` header line and a `units` column; knob-off output is
+# unchanged. See docs/paper-trading-accounting.md.
+max_position_pct = 0
 
 # Broker/venue API base URL — required in live mode.
 # broker_url = "https://broker.example/api"

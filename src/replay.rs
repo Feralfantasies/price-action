@@ -83,19 +83,28 @@ pub struct ReplaySession {
 impl ReplaySession {
     /// Creates an empty session trading `quantity` units from
     /// `starting_balance`, charging `trade_fee_bps` per side on each notional,
-    /// with the example strategy firing at `threshold` consecutive closes, leveraged
-    /// `max_leverage` times (1 = unleveraged, the documented default model).
+    /// with the example strategy firing at `threshold` consecutive closes,
+    /// leveraged `max_leverage` times (1 = unleveraged, the documented default
+    /// model) and sized by the `max_position_pct` risk knob (0 = off: the
+    /// fixed `quantity` units, the documented default model).
     #[must_use]
     pub fn new(
-        quantity: u32,
+        quantity: f64,
         starting_balance: f64,
         trade_fee_bps: u32,
         max_leverage: u32,
+        max_position_pct: f64,
         threshold: u32,
     ) -> Self {
         Self {
             engine: Engine::new(ConsecutiveCloses::new(threshold), PaperBroker::new()),
-            account: PaperAccount::new(quantity, starting_balance, trade_fee_bps, max_leverage),
+            account: PaperAccount::new(
+                quantity,
+                starting_balance,
+                trade_fee_bps,
+                max_leverage,
+                max_position_pct,
+            ),
             trace_lines: Vec::new(),
             entries: 0,
             skipped_entries: 0,
@@ -274,6 +283,7 @@ pub fn replay_bars(config: &Config, bars: &[Bar]) -> Result<ReplayReport, Error>
         config.starting_balance,
         config.trade_fee_bps,
         config.max_leverage,
+        config.max_position_pct,
         config.consecutive_closes_threshold,
     );
     for bar in bars {
@@ -325,13 +335,24 @@ pub fn render_report(
             config.max_leverage,
         )?;
     }
+    // A margin-sized run says so too, and names what it sizes: with the knob
+    // off (the default) this header stays byte-identical to what README.md and
+    // docs/replay-workflow.md pin.
+    if config.max_position_pct > 0.0 {
+        writeln!(
+            out,
+            "position sizing: {:.0}% of free funds as required margin (fractional units; fixed quantity={} ignored)",
+            config.max_position_pct,
+            config.quantity,
+        )?;
+    }
     writeln!(out, "{sep}")?;
     for line in &report.trace_lines {
         writeln!(out, "{line}")?;
     }
     writeln!(out, "{sep}")?;
 
-    print_closed_trades(out, report, config.max_leverage)?;
+    print_closed_trades(out, report, config.max_leverage, config.max_position_pct)?;
     write_blank_line(out)?;
     print_per_day_totals(out, report)?;
     write_blank_line(out)?;
@@ -366,11 +387,14 @@ pub fn print_report(
 /// printed: an unleveraged (1x) run keeps the historical table shape exactly,
 /// while a leveraged run shows the required margin and the notional the
 /// position actually controlled, so a 1x and a leveraged report over the same
-/// bars are visibly different.
+/// bars are visibly different. `max_position_pct` gates the `units` column in
+/// the same spirit: a fixed-quantity run keeps the historical shape, a
+/// margin-sized run shows the fractional size each entry actually put down.
 fn print_closed_trades(
     out: &mut dyn std::io::Write,
     report: &ReplayReport,
     leverage: u32,
+    max_position_pct: f64,
 ) -> std::io::Result<()> {
     writeln!(out, "closed paper trades (net of fees):")?;
     if report.closed_trades.is_empty() {
@@ -389,6 +413,10 @@ fn print_closed_trades(
         "fees".to_string(),
         "net P/L".to_string(),
     ];
+    let sized = max_position_pct > 0.0;
+    if sized {
+        header.insert(1, "units".to_string());
+    }
     if leverage > 1 {
         header.extend([
             "required margin".to_string(),
@@ -410,6 +438,9 @@ fn print_closed_trades(
             money2(t.fees_paid),
             signed2(t.net_pl),
         ];
+        if sized {
+            row.insert(1, units4(t.units));
+        }
         if leverage > 1 {
             row.extend([
                 money2(t.required_margin),
@@ -501,6 +532,12 @@ fn write_blank_line(out: &mut dyn std::io::Write) -> std::io::Result<()> {
 /// carried by [`signed2`]).
 fn money2(value: f64) -> String {
     format!("{value:.2}")
+}
+
+/// Position size in units, wide enough that a fractional size (0.05 of a coin)
+/// stays legible rather than rounding to `0.00`.
+fn units4(value: f64) -> String {
+    format!("{value:.4}")
 }
 
 /// Signed two-decimal money (`+1.00`, `-2.50`, `+0.00`).
@@ -661,7 +698,7 @@ mod tests {
     fn session_exposes_the_skipped_entry_counter() {
         // Threshold 1: the falling close signals Short on bar 2; one unit at
         // 9.00 cannot be funded from a 1.00 balance.
-        let mut session = ReplaySession::new(1, 1.0, 5, 1, 1);
+        let mut session = ReplaySession::new(1.0, 1.0, 5, 1, 0.0, 1);
         assert_eq!(session.skipped_entries(), 0);
         let _ = session.on_bar(&bar(10.0, 0)).expect("first bar");
         assert_eq!(session.skipped_entries(), 0);
@@ -746,6 +783,7 @@ mod tests {
             config.starting_balance,
             config.trade_fee_bps,
             config.max_leverage,
+            config.max_position_pct,
             config.consecutive_closes_threshold,
         );
         for b in &bars {
@@ -781,6 +819,7 @@ mod tests {
             config.starting_balance,
             config.trade_fee_bps,
             config.max_leverage,
+            config.max_position_pct,
             config.consecutive_closes_threshold,
         );
 
