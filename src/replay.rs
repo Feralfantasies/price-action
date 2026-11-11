@@ -341,8 +341,8 @@ pub fn render_report(
     if config.max_position_pct > 0.0 {
         writeln!(
             out,
-            "position sizing: {:.0}% of free funds as required margin (fractional units; fixed quantity={} ignored)",
-            config.max_position_pct,
+            "position sizing: {}% of free funds as required margin (fractional units; fixed quantity={} ignored)",
+            pct_str(config.max_position_pct),
             config.quantity,
         )?;
     }
@@ -439,7 +439,7 @@ fn print_closed_trades(
             signed2(t.net_pl),
         ];
         if sized {
-            row.insert(1, units4(t.units));
+            row.insert(1, units_str(t.units));
         }
         if leverage > 1 {
             row.extend([
@@ -534,10 +534,34 @@ fn money2(value: f64) -> String {
     format!("{value:.2}")
 }
 
-/// Position size in units, wide enough that a fractional size (0.05 of a coin)
-/// stays legible rather than rounding to `0.00`.
-fn units4(value: f64) -> String {
-    format!("{value:.4}")
+/// Position size in units: four decimals by default, widened (in twos, up to
+/// 16) when that would round a nonzero size to zero, so a tiny but real
+/// position stays visibly nonzero in the `units` column and the live
+/// mock-trade line. Larger sizes keep their readable `1.5000` shape.
+pub(crate) fn units_str(value: f64) -> String {
+    if value == 0.0 {
+        return "0.0000".to_string();
+    }
+    // Four decimals by default; widened when that would round a nonzero size
+    // to zero, so a tiny but real position stays visibly nonzero.
+    for decimals in [4usize, 6, 8, 10, 12, 14, 16] {
+        let text = format!("{value:.decimals$}");
+        if text.trim_end_matches('0').trim_end_matches('.') != "0" {
+            return text;
+        }
+    }
+    format!("{value:.16}") // sub-16-decimal sizes are below display range
+}
+
+/// `max_position_pct` for the sizing header: whole percents stay whole (`10`)
+/// while fractional ones keep their decimals (`0.1`, `12.5`) instead of
+/// rounding to a misleading whole number.
+fn pct_str(value: f64) -> String {
+    if value.fract() == 0.0 {
+        return format!("{value:.0}");
+    }
+    let text = format!("{value:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Signed two-decimal money (`+1.00`, `-2.50`, `+0.00`).
@@ -871,5 +895,50 @@ mod tests {
         render_report(&config, &report, "live", &mut buf).expect("print");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.starts_with("price-action live - 1 bars"), "{text}");
+    }
+
+    #[test]
+    fn units_str_keeps_tiny_sizes_visibly_nonzero() {
+        // The historical four-decimal shape is kept for readable sizes...
+        assert_eq!(units_str(1.5), "1.5000");
+        assert_eq!(units_str(0.05), "0.0500");
+        assert_eq!(units_str(0.0), "0.0000");
+        // ...and a nonzero size that four decimals would round to zero is
+        // widened until it is visibly nonzero.
+        assert_eq!(units_str(0.00004), "0.000040");
+        assert_eq!(units_str(0.000_000_000_1), "0.0000000001");
+    }
+
+    #[test]
+    fn sizing_header_keeps_fractional_percents_readable() {
+        // A fractional percent must not round to `0%` in the sizing header.
+        let config = Config {
+            max_position_pct: 0.1,
+            ..Config::default()
+        };
+        let report = replay_bars(&config, &[bar(10.0, 0)]).expect("replay");
+        let mut buf = Vec::new();
+        render_report(&config, &report, "replay", &mut buf).expect("print");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains(
+                "position sizing: 0.1% of free funds as required margin (fractional units; fixed quantity=1 ignored)"
+            ),
+            "{text}"
+        );
+        // Whole percents stay whole, not `10.00`.
+        let config = Config {
+            max_position_pct: 10.0,
+            ..Config::default()
+        };
+        let report = replay_bars(&config, &[bar(10.0, 0)]).expect("replay");
+        let mut buf = Vec::new();
+        render_report(&config, &report, "replay", &mut buf).expect("print");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains("position sizing: 10% of free funds"),
+            "{text}"
+        );
+        assert_eq!(pct_str(12.5), "12.5");
     }
 }
