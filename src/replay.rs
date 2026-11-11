@@ -557,10 +557,11 @@ pub(crate) fn units_str(value: f64) -> String {
 }
 
 /// `max_position_pct` for the sizing header: whole percents stay whole (`10`)
-/// while fractional ones keep their decimals (`0.1`, `0.001`, `12.5`),
-/// widened (in twos, up to 16) when fewer would round a nonzero percent to
-/// `0`; below 1e-16 it falls back to scientific notation instead of a
-/// misleading whole number.
+/// while fractional ones keep their decimals (`0.1`, `0.001`, `0.0051`,
+/// `12.5`), widened (in twos, up to 16) to the first width that renders the
+/// value **accurately** — its digits parse back to the same value — rather
+/// than merely visibly; below 1e-16 it falls back to scientific notation
+/// instead of a misleading whole number.
 fn pct_str(value: f64) -> String {
     if value.fract() == 0.0 {
         return format!("{value:.0}");
@@ -568,8 +569,14 @@ fn pct_str(value: f64) -> String {
     for decimals in [2usize, 4, 6, 8, 10, 12, 14, 16] {
         let text = format!("{value:.decimals$}");
         let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-        if trimmed != "0" {
-            return trimmed.to_string();
+        // A width is acceptable only if it is faithful: the rendered digits
+        // must parse back to exactly this value (0.0051 needs four places,
+        // not the two-place `0.01` that merely looks nonzero). Bit equality
+        // is deliberate — an epsilon would accept a rounded digit.
+        if let Ok(back) = trimmed.parse::<f64>() {
+            if back.to_bits() == value.to_bits() {
+                return trimmed.to_string();
+            }
         }
     }
     format!("{value:e}")
@@ -955,5 +962,20 @@ mod tests {
         assert_eq!(pct_str(12.5), "12.5");
         // Smaller fractional percents widen instead of rounding to `0`.
         assert_eq!(pct_str(0.001), "0.001");
+        // ...and a width is only accepted when it renders the value
+        // accurately: 0.0051 must not be reported as the two-place `0.01`.
+        let config = Config {
+            max_position_pct: 0.0051,
+            ..Config::default()
+        };
+        let report = replay_bars(&config, &[bar(10.0, 0)]).expect("replay");
+        let mut buf = Vec::new();
+        render_report(&config, &report, "replay", &mut buf).expect("print");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(
+            text.contains("position sizing: 0.0051% of free funds"),
+            "{text}"
+        );
+        assert_eq!(pct_str(0.0051), "0.0051");
     }
 }
