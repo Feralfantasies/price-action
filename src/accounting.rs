@@ -1064,7 +1064,7 @@ mod tests {
         assert!(out.state.available.is_finite());
         assert!(out.state.equity.is_finite());
         near(out.state.available, 100.0); // nothing committed
-        assert!(acc.closed_trades().is_empty());
+        assert_eq!(acc.closed_trades().len(), 0);
         // A later positive close still trades normally.
         let out = acc.on_bar(&S::Long, 1, &bar(10.0, D_BASE));
         assert!(!out.entry_skipped);
@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!(out.skipped_entry_cost, None); // skipped before any sizing
         assert_eq!(out.effective_signal, S::Flat);
         near(out.state.available, 100.0); // nothing committed
-        assert!(acc.closed_trades().is_empty());
+        assert_eq!(acc.closed_trades().len(), 0);
         // A positive close still takes the fixed-quantity model byte-for-byte.
         let out = acc.on_bar(&S::Long, 1, &bar(9.0, D_BASE));
         assert!(!out.entry_skipped);

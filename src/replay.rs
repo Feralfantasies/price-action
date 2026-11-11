@@ -537,7 +537,9 @@ fn money2(value: f64) -> String {
 /// Position size in units: four decimals by default, widened (in twos, up to
 /// 16) when that would round a nonzero size to zero, so a tiny but real
 /// position stays visibly nonzero in the `units` column and the live
-/// mock-trade line. Larger sizes keep their readable `1.5000` shape.
+/// mock-trade line. Larger sizes keep their readable `1.5000` shape, and a
+/// positive size too small for sixteen decimals falls back to scientific
+/// notation (`1e-20`) rather than printing as zero.
 pub(crate) fn units_str(value: f64) -> String {
     if value == 0.0 {
         return "0.0000".to_string();
@@ -550,18 +552,27 @@ pub(crate) fn units_str(value: f64) -> String {
             return text;
         }
     }
-    format!("{value:.16}") // sub-16-decimal sizes are below display range
+    // Positive but below 1e-16: fixed decimals cannot show it at all.
+    format!("{value:e}")
 }
 
 /// `max_position_pct` for the sizing header: whole percents stay whole (`10`)
-/// while fractional ones keep their decimals (`0.1`, `12.5`) instead of
-/// rounding to a misleading whole number.
+/// while fractional ones keep their decimals (`0.1`, `0.001`, `12.5`),
+/// widened (in twos, up to 16) when fewer would round a nonzero percent to
+/// `0`; below 1e-16 it falls back to scientific notation instead of a
+/// misleading whole number.
 fn pct_str(value: f64) -> String {
     if value.fract() == 0.0 {
         return format!("{value:.0}");
     }
-    let text = format!("{value:.2}");
-    text.trim_end_matches('0').trim_end_matches('.').to_string()
+    for decimals in [2usize, 4, 6, 8, 10, 12, 14, 16] {
+        let text = format!("{value:.decimals$}");
+        let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+        if trimmed != "0" {
+            return trimmed.to_string();
+        }
+    }
+    format!("{value:e}")
 }
 
 /// Signed two-decimal money (`+1.00`, `-2.50`, `+0.00`).
@@ -907,6 +918,8 @@ mod tests {
         // widened until it is visibly nonzero.
         assert_eq!(units_str(0.00004), "0.000040");
         assert_eq!(units_str(0.000_000_000_1), "0.0000000001");
+        // Positive but below 1e-16: scientific notation, never zero.
+        assert_eq!(units_str(0.000_000_000_000_000_001), "1e-18");
     }
 
     #[test]
@@ -940,5 +953,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(pct_str(12.5), "12.5");
+        // Smaller fractional percents widen instead of rounding to `0`.
+        assert_eq!(pct_str(0.001), "0.001");
     }
 }

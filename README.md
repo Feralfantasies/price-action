@@ -450,15 +450,17 @@ price-action replay bars.csv
 PRICE_ACTION_MAX_POSITION_PCT=10 price-action replay bars.csv
 ```
 
-A and B differ in exactly two places, both conditional on the knob. B's
-header gains the sizing line (`position sizing: 10% of free funds as required
-margin (fractional units; fixed quantity=1 ignored)`), and B's closed-trades
-table gains a `units` column showing the fractional size each entry actually
-put down — on one 10,000-fund account and a 100-unit coin, A trades a fixed
-`1` unit (gross P/L `+2.00` on a 2.00 move) while B's entry sizes
-`9.8425` units from `1000 ÷ 101.60` (gross P/L `+19.69` on the same move).
-A stays byte-identical to the historical report: no sizing line, no `units`
-column. A fractional knob keeps its decimals — `MAX_POSITION_PCT=0.1`
+The knob changes two *format* things, both conditional on it: B's header
+gains the sizing line (`position sizing: 10% of free funds as required margin
+(fractional units; fixed quantity=1 ignored)`), and B's closed-trades table
+gains a `units` column showing the fractional size each entry actually put
+down. Everything else in the layout is the same, but the money figures are
+not — because the positions are sized differently, B's trade P/L, fees,
+cash and equity all differ from A's: on one 10,000-fund account and a
+100-unit coin, A trades a fixed `1` unit (gross P/L `+2.00` on a 2.00 move)
+while B's entry sizes `9.8425` units from `1000 ÷ 101.60` (gross P/L `+19.69`
+on the same move). A stays byte-identical to the historical report: no
+sizing line, no `units` column. A fractional knob keeps its decimals — `MAX_POSITION_PCT=0.1`
 prints `position sizing: 0.1% ...`, never `0%` — and a tiny nonzero unit size
 widens its decimals (`0.000040`) rather than rounding to `0.0000`, so a real
 position is never invisible in the report.
