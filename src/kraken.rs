@@ -1107,7 +1107,7 @@ pub fn resolve_from_tables(
         };
         let internal = internal_key.trim().to_ascii_uppercase();
 
-        by_internal.entry(internal.clone()).or_insert(internal_key);
+        by_internal.entry(internal).or_insert(internal_key);
         by_altname.entry(altname).or_insert(internal_key);
         if let Some(display) = display_of(entry) {
             by_display.entry(display).or_insert(internal_key);
