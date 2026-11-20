@@ -14,7 +14,7 @@ sources:
   - id: liversrc
     resource: /src/live.rs
     title: Live session source (same account, daily summaries)
-generated: { by: pi-agent/qwen3.8-max, at: 2026-09-28T02:25:00Z }
+generated: { by: pi-agent/qwen3.8-max, at: 2026-11-11T02:36:14Z }
 ---
 
 The replay report is not a passive signal trace: it also runs each bar's
@@ -78,12 +78,13 @@ is rebuilt by re-replaying them rather than stored.
   the position and returns at exit.
 - **Exit:** releases the committed notional, credits signed gross P/L, then
   charges the exit fee on the *exit* bar's notional:
-  - long: `gross = (exit − entry) × units`
-  - short: `gross = (entry − exit) × units`
+  - long: `gross = (exit − entry) × units × max_leverage`
+  - short: `gross = (entry − exit) × units × max_leverage`
 
   `net = gross − (entry fee + exit fee)`; net is what every roll-up sums.
-- **Insufficient funds:** if `required margin + entry fee > free funds`, the entry is
-  **skipped** — the trace still prints the raw strategy signal with an
+- **Insufficient funds:** if `required margin + entry fee > free funds` — or the
+  bar's close is non-positive, so nothing can be sized or priced at it — the
+  entry is **skipped** — the trace still prints the raw strategy signal with an
   `(insufficient funds)` note and no position opens. The gate's own
   `margin + fee` figure leaves the account as `BarOutcome::skipped_entry_cost`
   so loggers can quote the decision's numbers without re-deriving them — a
